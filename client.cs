@@ -344,6 +344,24 @@ public static class Platform
     public static string ShellExecutable()
     {
         if (IsAndroid()) return Which("sh") is { Length: > 0 } sh ? sh : "/system/bin/sh";
+        if (IsIos())
+        {
+            // iOS only offers /bin/sh on jailbroken devices; a-Shell and iSH
+            // ship their own shells under /bin.
+            foreach (var candidate in new[] { "/bin/sh", "/bin/bash", "/bin/zsh" })
+                if (File.Exists(candidate)) return candidate;
+            return Which("sh") is { Length: > 0 } iosSh ? iosSh : "/bin/sh";
+        }
+        if (IsMacOs())
+        {
+            // A client started from the Finder, a LaunchAgent or a plain
+            // launchctl job has no SHELL - fall through to the ordered chain
+            // instead of landing on the ancient /bin/bash macOS ships.
+            var shell = Environment.GetEnvironmentVariable("SHELL");
+            foreach (var candidate in new[] { shell, "/bin/zsh", "/bin/bash", "/bin/sh" })
+                if (!string.IsNullOrEmpty(candidate) && File.Exists(candidate)) return candidate;
+            return Which("sh") is { Length: > 0 } macSh ? macSh : "/bin/sh";
+        }
         return "";
     }
 
@@ -1452,13 +1470,19 @@ public static class Protocol
     public static void SendShellOutput(Conn conn, byte[] data)
     {
         if (data.Length == 0) return;
-        try
+        // The ConPTY reader and the startup notices can send at the same
+        // time.  TLS streams are not safe for concurrent writes, and a
+        // half-written record would desynchronise the whole shell channel.
+        lock (conn)
         {
-            SendBounded(conn, data, 0, data.Length, 30,
-                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0 + 300 + data.Length / 16384.0);
+            try
+            {
+                SendBounded(conn, data, 0, data.Length, 30,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0 + 300 + data.Length / 16384.0);
+            }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
         }
-        catch (IOException) { }
-        catch (ObjectDisposedException) { }
     }
 
     public static void SendBounded(Conn conn, byte[] data, int offset, int count,
@@ -5374,15 +5398,37 @@ public static class Shell
         var script = Platform.Which("script");
         if (!string.IsNullOrEmpty(script))
         {
-            ShellUnixWithScript(conn, script, command);
-            return;
+            // Every script(1) dialect spells "run this command" differently,
+            // and the differences are exactly why macOS used to fall into a
+            // dead shell channel.  The no-command form comes first because it
+            // is the only one shared by BSD (macOS), GNU and most other
+            // script(1) implementations: script -q /dev/null simply starts an
+            // interactive $SHELL inside a real PTY and relays raw bytes, so
+            // the terminal is sized by feeding one stty line to that shell
+            // afterwards.  The two argument forms stay as follow-ups for
+            // systems where the no-command form is not supported.
+            var attempts = new (string[] Args, string? FeedStty)[]
+            {
+                (new[] { "-q", "/dev/null" }, $"stty rows {rows} cols {cols}\n"),
+                (new[] { "-q", "/dev/null", "/bin/sh", "-c", command }, null),
+                (new[] { "-q", "-e", "-f", "-c", command, "/dev/null" }, null),
+            };
+            foreach (var (args, feedStty) in attempts)
+            {
+                if (ShellUnixWithScript(conn, script, args, feedStty)) return;
+                SendOutputText(conn,
+                    "\r\n[client] this script(1) form is not usable, trying the next one\r\n");
+            }
+            SendOutputText(conn,
+                "\r\n[client] no usable script(1) here; running a line-oriented shell\r\n");
         }
         // No script(1): start a shell on ordinary pipes. This keeps commands
         // and interactive programs usable, but cannot provide job control.
         ShellUnixPipes(conn, shell);
     }
 
-    private static void ShellUnixWithScript(Conn conn, string script, string command)
+    private static bool ShellUnixWithScript(Conn conn, string script,
+        string[] args, string? feedStty)
     {
         var psi = new ProcessStartInfo
         {
@@ -5393,17 +5439,8 @@ public static class Shell
             UseShellExecute = false,
             CreateNoWindow = true
         };
-        if (Platform.IsDarwin)
-        {
-            // macOS script(1) has a different command-line shape.
-            foreach (var arg in new[] { "-q", "/dev/null", "/bin/sh", "-c", command })
-                psi.ArgumentList.Add(arg);
-        }
-        else
-        {
-            foreach (var arg in new[] { "-q", "-e", "-f", "-c", command, "/dev/null" })
-                psi.ArgumentList.Add(arg);
-        }
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
         psi.Environment["TERM"] = "dumb";
         psi.Environment.Remove("COLORTERM");
         psi.Environment["PYTHONUNBUFFERED"] = "1";
@@ -5411,9 +5448,33 @@ public static class Shell
             psi.Environment["PYTHONIOENCODING"] = "utf-8";
 
         using var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
-        if (!proc.Start()) throw new IOException("cannot start " + script);
         try
         {
+            try
+            {
+                if (!proc.Start()) return false;
+            }
+            catch
+            {
+                return false;          // exists but cannot exec: next form
+            }
+            // A very fast failure (an unsupported flag set, an old busybox
+            // script without -e, ...) means this dialect is not usable:
+            // report it and let the caller try the next form instead of
+            // leaving a dead channel.
+            if (proc.WaitForExit(250)) return false;
+            if (feedStty != null)
+            {
+                // No-command form: size the PTY from inside by letting the
+                // freshly started interactive shell run one stty line first.
+                try
+                {
+                    var stty = Encoding.ASCII.GetBytes(feedStty);
+                    proc.StandardInput.BaseStream.Write(stty, 0, stty.Length);
+                    proc.StandardInput.BaseStream.Flush();
+                }
+                catch { }
+            }
             var stdout = proc.StandardOutput.BaseStream;
             var stderr = proc.StandardError.BaseStream;
             var reader = new Thread(() =>
@@ -5492,6 +5553,7 @@ public static class Shell
             reader.Join(1000);
             try { proc.Kill(true); } catch { }
             try { proc.WaitForExit(500); } catch { }
+            return true;
         }
         finally
         {
@@ -5503,6 +5565,19 @@ public static class Shell
             try { proc.WaitForExit(500); } catch { }
         }
     }
+
+    // Own session -> Ctrl+C can hit the shell's group without ever touching
+    // the client itself, exactly like the Python client's pipe bridge.
+    private static class LibC
+    {
+        [DllImport("libc", SetLastError = true)]
+        public static extern int setpgid(int pid, int pgid);
+
+        [DllImport("libc", SetLastError = true)]
+        public static extern int kill(int pid, int sig);
+    }
+
+    private const int UnixSigint = 2;
 
     private static void ShellUnixPipes(Conn conn, string shell)
     {
@@ -5520,7 +5595,23 @@ public static class Shell
         psi.Environment.Remove("COLORTERM");
         psi.Environment["PYTHONUNBUFFERED"] = "1";
         using var proc = new Process { StartInfo = psi };
-        if (!proc.Start()) throw new IOException("cannot start " + shell);
+        try
+        {
+            proc.Start();
+        }
+        catch (Exception ex)
+        {
+            // Without this notice the shell channel just sat there empty.
+            SendOutputText(conn, $"\r\n[client] could not start {shell}: {ex.Message}\r\n");
+            return;
+        }
+        // Own process group: a later Ctrl+C signals the shell (and its
+        // foreground command) only, never this client.  The parent may
+        // setpgid() the child as long as both are still in the same session.
+        if (!Platform.IsWindows)
+        {
+            try { LibC.setpgid(proc.Id, proc.Id); } catch { }
+        }
         try
         {
             var reader = new Thread(() =>
@@ -5548,28 +5639,100 @@ public static class Shell
                 catch { }
             }) { IsBackground = true, Name = "pipe-shell-stderr" };
             errorDrain.Start();
-            var input = new BoundedInputWriter(data =>
+
+            // The controller's terminal is raw, so Enter arrives as a bare
+            // '\r'.  A shell reading from a *pipe* (not a terminal) does not
+            // strip '\r' - it would try to execute "cmd\r" and answer
+            // "command not found: ^M".  Every submitted line is therefore
+            // echoed locally and forwarded with a single trailing '\n' and
+            // no '\r'.
+            var stdin = proc.StandardInput.BaseStream;
+            var line = new List<byte>(256);
+            var lastWasCr = false;
+            bool PipeWrite(byte[] data)
             {
                 try
                 {
-                    proc.StandardInput.BaseStream.Write(data, 0, data.Length);
-                    proc.StandardInput.BaseStream.Flush();
+                    stdin.Write(data, 0, data.Length);
+                    stdin.Flush();
                     return true;
                 }
                 catch { return false; }
-            });
+            }
             var buffer = new byte[65536];
-            while (true)
+            var dead = false;
+            while (!dead)
             {
                 if (proc.HasExited && !reader.IsAlive) break;
                 var n = conn.Read(buffer, 0, buffer.Length, 200);
-                if (n < 0) { if (input.Failed) break; continue; }
+                if (n < 0) continue;
                 if (n == 0) break;
-                var copy = new byte[n];
-                Buffer.BlockCopy(buffer, 0, copy, 0, n);
-                input.Send(copy);
+                for (var i = 0; i < n && !dead; i++)
+                {
+                    var value = buffer[i];
+                    if (value == 0x0d || value == 0x0a)
+                    {
+                        if (value == 0x0a && lastWasCr)
+                        {
+                            lastWasCr = false;          // CRLF counts as one Enter
+                            continue;
+                        }
+                        lastWasCr = value == 0x0d;
+                        if (!SendOutputText(conn, "\r\n")) { dead = true; break; }
+                        var submitted = new byte[line.Count + 1];
+                        line.CopyTo(submitted);
+                        submitted[line.Count] = 0x0a;
+                        if (!PipeWrite(submitted)) { dead = true; break; }
+                        line.Clear();
+                        continue;
+                    }
+                    lastWasCr = false;
+                    if (value == 0x7f || value == 0x08)
+                    {
+                        if (line.Count > 0)
+                        {
+                            line.RemoveAt(line.Count - 1);
+                            if (!SendOutputText(conn, "\b \b")) { dead = true; break; }
+                        }
+                        continue;
+                    }
+                    if (value == 0x03)                  // Ctrl+C
+                    {
+                        line.Clear();
+                        if (!SendOutputText(conn, "^C\r\n")) { dead = true; break; }
+                        var signaled = false;
+                        if (!Platform.IsWindows)
+                        {
+                            try { signaled = LibC.kill(-proc.Id, UnixSigint) == 0; }
+                            catch { signaled = false; }
+                        }
+                        // 0x03 written to a pipe is just a byte, not an
+                        // interrupt; keep it as the last resort.
+                        if (!signaled && !PipeWrite(new byte[] { 0x03 })) { dead = true; break; }
+                        continue;
+                    }
+                    if (value == 0x04)                  // Ctrl+D
+                    {
+                        if (line.Count > 0)
+                        {
+                            var submitted = new byte[line.Count + 1];
+                            line.CopyTo(submitted);
+                            submitted[line.Count] = 0x0a;
+                            if (!SendOutputText(conn, "\r\n")) { dead = true; break; }
+                            if (!PipeWrite(submitted)) { dead = true; break; }
+                            line.Clear();
+                        }
+                        else
+                        {
+                            try { stdin.Close(); } catch { }
+                        }
+                        continue;
+                    }
+                    if (value < 0x20 && value != 0x09) continue;   // other control bytes
+                    line.Add(value);
+                    if (!SendOutput(conn, new[] { value }, 1)) { dead = true; break; }
+                }
             }
-            input.Close();
             try { proc.StandardInput.Close(); } catch { }
             try { proc.Kill(true); } catch { }
             try { proc.WaitForExit(500); } catch { }
@@ -5593,8 +5756,15 @@ public static class Shell
         catch { return false; }
     }
 
-    private static void SendOutputText(Conn conn, string text)
-        => Protocol.SendShellOutput(conn, Encoding.UTF8.GetBytes(text));
+    private static bool SendOutputText(Conn conn, string text)
+    {
+        try
+        {
+            Protocol.SendShellOutput(conn, Encoding.UTF8.GetBytes(text));
+            return true;
+        }
+        catch { return false; }
+    }
 
     // ---------------------------------------------------------------------
     // Windows ConPTY
@@ -5602,24 +5772,66 @@ public static class Shell
 
     private static void ShellWindows(Conn sock, int rows, int cols)
     {
-        if (Platform.IsWindows)
+        // The client is deliberately silent on Windows and is often started
+        // without a console.  A child that cannot attach to its console (the
+        // documented ConPTY failure, 0xc0000142) would otherwise raise a
+        // modal hard-error dialog that blocks the client and exposes it.
+        // Suppress those dialogs for the whole shell session; the child
+        // inherits this mode, and the controller still gets a diagnostic on
+        // the shell channel.
+        var suppressDialogs = Platform.IsWindows;
+        var oldErrorMode = 0u;
+        if (suppressDialogs)
+            oldErrorMode = Win32Kernel.SetErrorMode(
+                Win32Kernel.SEM_FAILCRITICALERRORS |
+                Win32Kernel.SEM_NOGPFAULTERRORBOX |
+                Win32Kernel.SEM_NOOPENFILEERRORBOX);
+        try
         {
+            void Notice(string text)
+            {
+                try { SendOutputText(sock, text); } catch { }
+            }
+            // Diagnostics switch: exercise the last-resort pipe fallback even
+            // when this machine has a working ConPTY.
+            var forcePipe = string.Equals(
+                Environment.GetEnvironmentVariable("CMON_SHELL_PIPE"), "1",
+                StringComparison.Ordinal);
+            if (forcePipe)
+                Notice("\r\n[client] pipe fallback forced by CMON_SHELL_PIPE.\r\n");
+            if (Platform.IsWindows && !forcePipe)
+            {
+                Notice("\r\n[client] Windows shell bridge starting.\r\n");
+                try
+                {
+                    if (ShellWindowsConPty(sock, rows, cols)) return;
+                    Notice("\r\n[client] ConPTY shell did not become ready; using the pipe fallback.\r\n");
+                }
+                catch (Exception ex)
+                {
+                    var reason = string.IsNullOrEmpty(ex.Message) ? ex.GetType().Name : ex.Message;
+                    Log.Error($"[!] ConPTY shell failed ({reason}); using the pipe fallback.");
+                    Notice($"\r\n[client] ConPTY unavailable: {reason}\r\n");
+                }
+            }
             try
             {
-                ShellWindowsConPty(sock, rows, cols);
-                return;
+                ShellWindowsPipes(sock);
             }
             catch (Exception ex)
             {
                 var reason = string.IsNullOrEmpty(ex.Message) ? ex.GetType().Name : ex.Message;
-                Log.Error($"[!] ConPTY shell failed ({reason}); using the pipe fallback.");
-                SendOutputText(sock, $"\r\n[client] ConPTY unavailable: {reason}\r\n");
+                Log.Error($"[!] pipe shell failed ({reason}).");
+                Notice($"\r\n[client] shell failed: {reason}\r\n");
             }
         }
-        ShellWindowsPipes(sock);
+        finally
+        {
+            if (suppressDialogs) Win32Kernel.SetErrorMode(oldErrorMode);
+        }
     }
 
-    private static void ShellWindowsConPty(Conn sock, int rows, int cols)
+    private static bool ShellWindowsConPty(Conn sock, int rows, int cols)
     {
         var k32 = Win32Kernel.Instance;
         var shell = Platform.Which("powershell.exe");
@@ -5633,10 +5845,16 @@ public static class Shell
         IntPtr outRead = IntPtr.Zero, outWrite = IntPtr.Zero;
         IntPtr hpc = IntPtr.Zero;
         IntPtr attrBuf = IntPtr.Zero;
+        var attrReady = false;
         IntPtr envBlock = IntPtr.Zero;
         var si = new STARTUPINFOEX();
         var pi = new PROCESS_INFORMATION();
         var stage = "starting";
+        long outputBytes = 0;
+        var outputUsable = 0;
+        var controllerClosed = false;
+        var startupTimedOut = false;
+        uint exitCode = 0;
         try
         {
             stage = "CreatePipe(input)";
@@ -5658,14 +5876,24 @@ public static class Shell
             attrBuf = Marshal.AllocHGlobal(needed);
             if (!Win32Kernel.InitializeProcThreadAttributeList(attrBuf, 1, 0, ref needed))
                 throw new IOException("InitializeProcThreadAttributeList: " + Win32Kernel.LastError());
+            attrReady = true;
             stage = "UpdateProcThreadAttribute";
+            // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE takes the HPCON value
+            // itself, exactly like the official MiniTerm sample and the
+            // Python client.  Passing &hpc makes CreateProcess treat the
+            // address of this local variable as the pseudoconsole handle;
+            // the child then cannot attach to its console and exits with
+            // STATUS_DLL_INIT_FAILED (0xc0000142, the popup).
             if (!Win32Kernel.UpdateProcThreadAttribute(attrBuf, 0, (IntPtr)0x00020016, hpc,
                     (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
                 throw new IOException("UpdateProcThreadAttribute: " + Win32Kernel.LastError());
 
             si.StartupInfo.cb = (uint)Marshal.SizeOf<STARTUPINFOEX>();
-            si.StartupInfo.dwFlags = 0;
-            si.StartupInfo.wShowWindow = 0;
+            // A correctly attached ConPTY child is windowless, but if the
+            // child ever falls back to its own console (or a profile launches
+            // a window) SW_HIDE keeps the Windows client completely silent.
+            si.StartupInfo.dwFlags = 0x00000001; // STARTF_USESHOWWINDOW
+            si.StartupInfo.wShowWindow = 0;      // SW_HIDE
             si.lpAttributeList = attrBuf;
 
             var environment = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -5690,9 +5918,12 @@ public static class Shell
             Win32Kernel.CloseHandle(inRead);
             Win32Kernel.CloseHandle(outWrite);
             inRead = outWrite = IntPtr.Zero;
+            SendOutputText(sock, $"\r\n[client] ConPTY child started (pid {pi.dwProcessId}).\r\n");
         }
         catch (Exception ex)
         {
+            try { if (pi.hProcess != IntPtr.Zero) Win32Kernel.TerminateProcess(pi.hProcess, 1); }
+            catch { }
             Win32Kernel.CloseHandle(inWrite);
             Win32Kernel.CloseHandle(outRead);
             Win32Kernel.CloseHandle(inRead);
@@ -5700,12 +5931,14 @@ public static class Shell
             if (hpc != IntPtr.Zero) Win32Kernel.ClosePseudoConsole(hpc);
             Win32Kernel.CloseHandle(pi.hThread);
             Win32Kernel.CloseHandle(pi.hProcess);
-            if (attrBuf != IntPtr.Zero) Win32Kernel.DeleteProcThreadAttributeList(attrBuf);
+            if (attrReady) Win32Kernel.DeleteProcThreadAttributeList(attrBuf);
+            if (attrBuf != IntPtr.Zero) Marshal.FreeHGlobal(attrBuf);
             if (envBlock != IntPtr.Zero) Marshal.FreeHGlobal(envBlock);
             throw new IOException(stage + ": " + ex.Message, ex);
         }
 
         var stop = new ManualResetEventSlim(false);
+        var classifier = new ConsoleOutputClassifier();
         var reader = new Thread(() =>
         {
             var buffer = new byte[65536];
@@ -5715,6 +5948,9 @@ public static class Shell
                 {
                     if (!Win32Kernel.ReadFile(outRead, buffer, (uint)buffer.Length, out var read, IntPtr.Zero)
                         || read == 0) break;
+                    Interlocked.Add(ref outputBytes, (int)read);
+                    classifier.Feed(buffer, (int)read);
+                    if (classifier.Usable) Interlocked.Exchange(ref outputUsable, 1);
                     var copy = new byte[read];
                     Buffer.BlockCopy(buffer, 0, copy, 0, (int)read);
                     if (!SendOutput(sock, copy, copy.Length)) break;
@@ -5738,7 +5974,10 @@ public static class Shell
                     var piece = offset == 0 ? data : data[offset..];
                     if (!Win32Kernel.WriteFile(inWrite, piece, (uint)piece.Length, out var written, IntPtr.Zero))
                     {
-                        if (Win32Kernel.GetLastError() == 995) return null;
+                        // Marshal.GetLastWin32Error() reads the error captured
+                        // by the P/Invoke (SetLastError=true); calling the
+                        // native GetLastError again is not reliable.
+                        if (Marshal.GetLastWin32Error() == 995) return null;
                         return false;
                     }
                     if (written == 0) return false;
@@ -5752,24 +5991,55 @@ public static class Shell
                 return write(Encoding.ASCII.GetBytes("\x03")) != false;
             });
             writer = new WindowsInputWriter(write, ctrlC);
+            SendOutputText(sock, "\r\n[client] ConPTY input ready.\r\n");
             var buffer = new byte[65536];
+            // A ConPTY child can stay alive without ever attaching to its
+            // console.  Escape-only startup output (cursor setup, a title)
+            // is not a usable prompt, so wait for printable text before
+            // declaring the console ready; after a bounded wait give up and
+            // let ShellWindows start the pipe fallback.
+            var startupDeadline = DateTime.UtcNow.AddSeconds(6);
             while (!stop.IsSet && !writer.Failed)
             {
+                if (Volatile.Read(ref outputUsable) == 0
+                    && DateTime.UtcNow >= startupDeadline)
+                {
+                    startupTimedOut = true;
+                    Log.Error("[!] ConPTY produced no usable prompt within 6 s ("
+                        + Interlocked.Read(ref outputBytes)
+                        + " raw bytes); using the pipe fallback.");
+                    break;
+                }
                 if (Win32Kernel.WaitForSingleObject(pi.hProcess, 0) == 0)
                 {
                     Thread.Sleep(80);
                     stop.Set();
+                    if (Volatile.Read(ref outputUsable) == 0)
+                        startupTimedOut = true;
                     break;
                 }
                 var n = sock.Read(buffer, 0, buffer.Length, 200);
                 if (n < 0) continue;
-                if (n == 0) break;
+                if (n == 0) { controllerClosed = true; break; }
                 var copy = new byte[n];
                 Buffer.BlockCopy(buffer, 0, copy, 0, n);
                 writer.Send(copy);
             }
+            // The reader thread sets stop when the ConPTY output pipe
+            // closes, so the loop can also end without a prompt.  Treat every
+            // such pre-prompt end as a failed console, not as a live shell.
+            if (!controllerClosed && Volatile.Read(ref outputUsable) == 0)
+                startupTimedOut = true;
         }
-        catch { }
+        catch (Exception ex)
+        {
+            // A failure before the first usable prompt means this console
+            // never became usable; let ShellWindows try the pipe fallback
+            // instead of leaving the controller connected to an empty shell.
+            if (Volatile.Read(ref outputUsable) == 0)
+                startupTimedOut = true;
+            Log.Error("[!] ConPTY bridge stopped: " + ex.Message);
+        }
         finally
         {
             stop.Set();
@@ -5777,36 +6047,87 @@ public static class Shell
             try { helper?.Close(); } catch { }
             try { Win32Kernel.TerminateProcess(pi.hProcess, 1); } catch { }
             try { Win32Kernel.WaitForSingleObject(pi.hProcess, 1000); } catch { }
+            try { Win32Kernel.GetExitCodeProcess(pi.hProcess, out exitCode); } catch { }
             try { if (hpc != IntPtr.Zero) Win32Kernel.ClosePseudoConsole(hpc); } catch { }
             try { reader.Join(1000); } catch { }
             Win32Kernel.CloseHandle(inWrite);
             Win32Kernel.CloseHandle(outRead);
             Win32Kernel.CloseHandle(pi.hThread);
             Win32Kernel.CloseHandle(pi.hProcess);
-            if (attrBuf != IntPtr.Zero) Win32Kernel.DeleteProcThreadAttributeList(attrBuf);
+            if (attrReady) Win32Kernel.DeleteProcThreadAttributeList(attrBuf);
+            if (attrBuf != IntPtr.Zero) Marshal.FreeHGlobal(attrBuf);
             if (envBlock != IntPtr.Zero) Marshal.FreeHGlobal(envBlock);
         }
+
+        // A ConPTY child that dies immediately without producing a single
+        // byte never attached to the pseudoconsole (the documented failure
+        // that shows 0xc0000142).  Do not leave the controller with an empty
+        // shell channel: report the failure and use the pipe fallback.
+        var startupFailure = !controllerClosed
+            && (startupTimedOut || exitCode == 0xC0000142u);
+        if (startupFailure)
+        {
+            if (startupTimedOut)
+                Log.Error("[!] ConPTY shell did not become ready; using the pipe fallback.");
+            else
+                Log.Error("[!] ConPTY shell exited during startup (0x"
+                    + exitCode.ToString("x8") + "); using the pipe fallback.");
+        }
+        return !startupFailure;
     }
 
     private static void ShellWindowsPipes(Conn sock)
     {
         var shell = Platform.Which("powershell.exe");
         if (string.IsNullOrEmpty(shell)) shell = "cmd.exe";
+        var shellArgs = shell.EndsWith("powershell.exe", StringComparison.OrdinalIgnoreCase)
+            ? "-NoLogo" : "";
         var psi = new ProcessStartInfo
         {
             FileName = shell,
+            Arguments = shellArgs,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
+            // The Ctrl+C helper needs a console to attach to.  Keeping
+            // CreateNoWindow=false gives the shell its own hidden console,
+            // while STARTF_USESHOWWINDOW/SW_HIDE keeps that console invisible.
+            // ConPTY remains the primary shell; this is the last resort.
             CreateNoWindow = false,
             WindowStyle = ProcessWindowStyle.Hidden
         };
         psi.Environment["PYTHONUNBUFFERED"] = "1";
+        // Detach the client from its own console first.  Otherwise a
+        // GenerateConsoleCtrlEvent(0, 0) from the helper would also signal
+        // the client and the shell that launched it.  With no parent console,
+        // Windows gives the pipe shell a fresh hidden console of its own, so
+        // Ctrl+C stays inside the remote shell.  If the detach fails while a
+        // console still exists, do not start the helper: raw 0x03 is safer
+        // than signalling the console that belongs to the local user.
+        var helperSafe = true;
+        try
+        {
+            if (!Win32Kernel.FreeConsole()
+                && Win32Kernel.GetConsoleWindow() != IntPtr.Zero)
+                helperSafe = false;
+        }
+        catch { helperSafe = false; }
         using var proc = new Process { StartInfo = psi };
         if (!proc.Start()) throw new IOException("cannot start " + shell);
+        Log.Info($"[shell] pipe shell started: {shell} pid {proc.Id}");
+        try
+        {
+            SendOutputText(sock, "\r\n[client] pipe shell ready.\r\n");
+        }
+        catch
+        {
+            try { proc.Kill(true); } catch { }
+            throw;
+        }
         var stop = new ManualResetEventSlim(false);
         var sendLock = new object();
+        var stdinLock = new object();
         bool SendRaw(byte[] data)
         {
             lock (sendLock)
@@ -5830,7 +6151,7 @@ public static class Shell
                     if (!SendRaw(copy)) break;
                 }
             }
-            catch { }
+            catch (Exception ex) { Log.Error("[shell] pipe shell stdout error: " + ex.Message); }
             finally
             {
                 stop.Set();
@@ -5852,11 +6173,17 @@ public static class Shell
                     if (!SendRaw(copy)) break;
                 }
             }
-            catch { }
+            catch (Exception ex) { Log.Error("[shell] pipe shell stderr error: " + ex.Message); }
         }) { IsBackground = true, Name = "pipe-shell-stderr" };
         errPump.Start();
 
-        var helper = Platform.IsWindows ? new WindowsCtrlCHelper((uint)proc.Id) : null;
+        WindowsCtrlCHelper? helper = null;
+        try
+        {
+            helper = Platform.IsWindows && helperSafe
+                ? new WindowsCtrlCHelper((uint)proc.Id) : null;
+        }
+        catch (Exception ex) { Log.Error("[shell] ctrl-c helper failed: " + ex.Message); }
         var lines = new BlockingCollection<string>(64);
         var writerThread = new Thread(() =>
         {
@@ -5866,10 +6193,13 @@ public static class Shell
                 try
                 {
                     var bytes = Encoding.UTF8.GetBytes(line + "\r\n");
-                    proc.StandardInput.BaseStream.Write(bytes, 0, bytes.Length);
-                    proc.StandardInput.BaseStream.Flush();
+                    lock (stdinLock)
+                    {
+                        proc.StandardInput.BaseStream.Write(bytes, 0, bytes.Length);
+                        proc.StandardInput.BaseStream.Flush();
+                    }
                 }
-                catch { stop.Set(); break; }
+                catch (Exception ex) { Log.Error("[shell] pipe shell input error: " + ex.Message); stop.Set(); break; }
             }
         }) { IsBackground = true, Name = "pipe-shell-input" };
         writerThread.Start();
@@ -5917,12 +6247,17 @@ public static class Shell
                     {
                         lineBuf.Clear();
                         SendRaw(Encoding.UTF8.GetBytes("^C\r\n"));
-                        if (helper == null || !helper.Send())
+                        var ctrlSent = helper != null && helper.Send();
+                        Log.Info("[shell] ctrl-c helper delivered=" + ctrlSent);
+                        if (!ctrlSent)
                         {
                             try
                             {
-                                proc.StandardInput.BaseStream.WriteByte(3);
-                                proc.StandardInput.BaseStream.Flush();
+                                lock (stdinLock)
+                                {
+                                    proc.StandardInput.BaseStream.WriteByte(3);
+                                    proc.StandardInput.BaseStream.Flush();
+                                }
                             }
                             catch { stop.Set(); }
                         }
@@ -5940,7 +6275,7 @@ public static class Shell
                 }
             }
         }
-        catch { }
+        catch (Exception ex) { Log.Error("[shell] pipe shell bridge error: " + ex.Message); }
         finally
         {
             stop.Set();
@@ -5950,6 +6285,12 @@ public static class Shell
             lines.CompleteAdding();
             try { writerThread.Join(500); } catch { }
             try { proc.WaitForExit(500); } catch { }
+            try
+            {
+                Log.Info("[shell] pipe shell exiting: hasExited=" + proc.HasExited
+                    + " code=" + (proc.HasExited ? proc.ExitCode : -1));
+            }
+            catch { }
         }
     }
 
@@ -5980,6 +6321,58 @@ public static class Shell
     // Windows helpers
     // ---------------------------------------------------------------------
 
+    /// <summary>
+    /// Distinguish a real console prompt from ConPTY's startup chatter.
+    /// ConPTY emits terminal-control sequences (clear screen, cursor, title)
+    /// before the shell renders anything.  Counting those bytes as "output"
+    /// disabled the startup watchdog and left the controller on a blank
+    /// screen when the child never attached.  This small VT parser ignores
+    /// CSI/OSC/DCS sequences and reports the first printable character.
+    /// </summary>
+    private sealed class ConsoleOutputClassifier
+    {
+        private int _state;                 // 0 text, 1 ESC, 2 CSI, 3 OSC/string,
+                                            // 4 OSC ESC, 5 ESC intermediate
+
+        public bool Usable { get; private set; }
+
+        public void Feed(byte[] data, int count)
+        {
+            for (var i = 0; i < count && !Usable; i++)
+            {
+                var value = data[i];
+                switch (_state)
+                {
+                    case 0:
+                        if (value == 0x1b) _state = 1;
+                        else if (value >= 0x20 && value != 0x7f) Usable = true;
+                        break;
+                    case 1:
+                        if (value == (byte)'[') _state = 2;
+                        else if (value is (byte)']' or (byte)'P' or (byte)'^' or (byte)'_')
+                            _state = 3;
+                        else if (value >= 0x20 && value <= 0x2f) _state = 5;
+                        else _state = 0;
+                        break;
+                    case 2:                 // CSI runs to a final byte @..~
+                        if (value >= 0x40 && value <= 0x7e) _state = 0;
+                        break;
+                    case 3:                 // OSC/DCS/PM/APC ends at BEL or ST
+                        if (value == 0x07) _state = 0;
+                        else if (value == 0x1b) _state = 4;
+                        break;
+                    case 4:
+                        if (value == (byte)'\\') _state = 0;
+                        else if (value != 0x1b) _state = 3;
+                        break;
+                    case 5:                 // ESC intermediates, then one final byte
+                        if (value < 0x20 || value > 0x2f) _state = 0;
+                        break;
+                }
+            }
+        }
+    }
+
     private sealed class WindowsInputWriter
     {
         private readonly Func<byte[], bool?> _writeChunk;
@@ -5990,7 +6383,7 @@ public static class Shell
         private int _dataLength;
         private int _ctrl;
         private bool _stop;
-        private int _threadId;
+        private volatile int _threadId;
         public int Dropped;
         public volatile bool Failed;
         private readonly Thread _thread;
@@ -6006,60 +6399,38 @@ public static class Shell
         public void Send(byte[] data)
         {
             if (data.Length == 0 || Failed) return;
-            var pieces = SplitCtrlC(data);
+            var lastCtrl = Array.LastIndexOf(data, (byte)3);
+            var tailStart = lastCtrl + 1;
+            var ctrlCount = 0;
+            for (var i = 0; i <= lastCtrl; i++)
+                if (data[i] == 3) ctrlCount++;
             var gotCtrl = false;
             lock (_gate)
             {
-                foreach (var (piece, isLast) in pieces)
+                if (lastCtrl >= 0)
                 {
-                    if (piece.Length > 0)
+                    // Ctrl+C cancels the line.  Drop bytes that were queued
+                    // before it too, otherwise they arrive after the shell's
+                    // fresh prompt and look like stray input.
+                    _dataLength = 0;
+                    _ctrl = Math.Min(_ctrl + ctrlCount, 64);
+                }
+                var tailLength = data.Length - tailStart;
+                if (tailLength > 0)
+                {
+                    var room = Math.Max(0, _maxPending - _dataLength);
+                    var take = Math.Min(tailLength, room);
+                    if (take > 0)
                     {
-                        var room = Math.Max(0, _maxPending - _dataLength);
-                        var take = Math.Min(piece.Length, room);
-                        if (take > 0)
-                        {
-                            Buffer.BlockCopy(piece, 0, _data, _dataLength, take);
-                            _dataLength += take;
-                        }
-                        if (take < piece.Length) Dropped += piece.Length - take;
+                        Buffer.BlockCopy(data, tailStart, _data, _dataLength, take);
+                        _dataLength += take;
                     }
-                    if (!isLast) _ctrl = Math.Min(_ctrl + 1, 64);
+                    if (take < tailLength) Dropped += tailLength - take;
                 }
                 gotCtrl = _ctrl > 0;
                 Monitor.PulseAll(_gate);
             }
             if (gotCtrl) CancelBlockedWrite();
-        }
-
-        private static List<(byte[] Piece, bool IsLast)> SplitCtrlC(byte[] data)
-        {
-            var pieces = new List<(byte[], bool)>();
-            var start = 0;
-            for (var i = 0; i < data.Length; i++)
-            {
-                if (data[i] != 3) continue;
-                if (i > start)
-                {
-                    var piece = new byte[i - start];
-                    Buffer.BlockCopy(data, start, piece, 0, piece.Length);
-                    pieces.Add((piece, false));
-                }
-                else pieces.Add((Array.Empty<byte>(), false));
-                start = i + 1;
-            }
-            if (start < data.Length)
-            {
-                var tail = new byte[data.Length - start];
-                Buffer.BlockCopy(data, start, tail, 0, tail.Length);
-                pieces.Add((tail, true));
-            }
-            else if (pieces.Count == 0) pieces.Add((Array.Empty<byte>(), true));
-            else
-            {
-                var last = pieces[^1];
-                pieces[^1] = (last.Item1, true);
-            }
-            return pieces;
         }
 
         private void CancelBlockedWrite()
@@ -6123,6 +6494,7 @@ public static class Shell
         private readonly object _gate = new();
         private string? _response;
         private Thread? _reader;
+        private Thread? _stderrDrain;
 
         public WindowsCtrlCHelper(uint pid)
         {
@@ -6133,10 +6505,30 @@ public static class Shell
                 psi.RedirectStandardOutput = true;
                 psi.RedirectStandardError = true;
                 psi.UseShellExecute = false;
-                psi.CreateNoWindow = false;
+                // No console of its own: the helper calls FreeConsole() and
+                // then AttachConsole(target).  Creating one would be a visible
+                // window and would also make that AttachConsole fail.
+                psi.CreateNoWindow = true;
                 _proc = Process.Start(psi);
                 if (_proc == null) throw new IOException("cannot start ctrl-c helper");
-                try { _proc.StandardError.BaseStream.CopyTo(Stream.Null); } catch { }
+                // Never drain stderr synchronously here.  The helper lives for
+                // the whole shell session, so CopyTo() would block forever on
+                // the open stderr pipe and the caller would never reach the
+                // input loop (the controller could connect but no keystroke
+                // would ever reach the shell).
+                var proc = _proc;
+                _stderrDrain = new Thread(() =>
+                {
+                    try
+                    {
+                        var first = proc.StandardError.ReadLine();
+                        if (!string.IsNullOrWhiteSpace(first))
+                            Log.Error("[shell] ctrl-c helper: " + first.Trim());
+                        proc.StandardError.BaseStream.CopyTo(Stream.Null);
+                    }
+                    catch { }
+                }) { IsBackground = true, Name = "windows-ctrlc-helper-stderr" };
+                _stderrDrain.Start();
                 _reader = new Thread(Reader) { IsBackground = true, Name = "windows-ctrlc-helper" };
                 _reader.Start();
             }
@@ -6269,6 +6661,15 @@ public static class Shell
         private static readonly Lazy<Win32Kernel> LazyInstance = new(() => new Win32Kernel());
         public static Win32Kernel Instance => LazyInstance.Value;
 
+        // Error modes that stop Windows from raising modal hard-error
+        // dialogs for a child that fails during process startup.
+        public const uint SEM_FAILCRITICALERRORS = 0x0001;
+        public const uint SEM_NOGPFAULTERRORBOX = 0x0002;
+        public const uint SEM_NOOPENFILEERRORBOX = 0x8000;
+
+        [DllImport("kernel32.dll")]
+        public static extern uint SetErrorMode(uint mode);
+
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern int GetCurrentThreadId();
 
@@ -6276,6 +6677,12 @@ public static class Shell
         public static extern uint GetLastError();
 
         public static string LastError() => new System.ComponentModel.Win32Exception((int)GetLastError()).Message;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool FreeConsole();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetConsoleWindow();
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool CreatePipe(out IntPtr read, out IntPtr write, IntPtr attributes, uint size);
@@ -6312,11 +6719,14 @@ public static class Shell
             out uint read, IntPtr overlapped);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern bool WriteFile(IntPtr file, [Out] byte[] buffer, uint count,
+        public static extern bool WriteFile(IntPtr file, [In] byte[] buffer, uint count,
             out uint written, IntPtr overlapped);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
@@ -8951,9 +9361,10 @@ public static class SelfExec
 
     public static ProcessStartInfo HelperStartInfo(params string[] args)
     {
-        var psi = StartInfo(args);
-        psi.CreateNoWindow = false;
-        return psi;
+        // The Ctrl+C helper attaches to the hosted console itself, so it must
+        // never create one of its own: a console window would be visible on
+        // screen and FreeConsole() is called before AttachConsole() anyway.
+        return StartInfo(args);
     }
 
     public static string QuotePosix(string value)
@@ -9886,7 +10297,16 @@ public static class Program
                     if (AttachConsole(pid)) { attached = true; break; }
                     Thread.Sleep(50);
                 }
-                if (!attached) return 2;
+                if (!attached)
+                {
+                    try
+                    {
+                        Console.Error.WriteLine("attach-failed error="
+                            + Marshal.GetLastWin32Error());
+                    }
+                    catch { }
+                    return 2;
+                }
                 SetConsoleCtrlHandler(IntPtr.Zero, true);
                 var output = Console.OpenStandardOutput();
                 var input = new StreamReader(Console.OpenStandardInput(), Encoding.ASCII);
@@ -9901,7 +10321,17 @@ public static class Program
                     var line = input.ReadLine();
                     if (line == null) break;
                     if (line.Trim() != "C") continue;
-                    writer.WriteLine(GenerateConsoleCtrlEvent(0, 0) ? "D" : "E");
+                    var delivered = GenerateConsoleCtrlEvent(0, 0);
+                    writer.WriteLine(delivered ? "D" : "E");
+                    if (!delivered)
+                    {
+                        try
+                        {
+                            Console.Error.WriteLine("ctrl-event-failed error="
+                                + Marshal.GetLastWin32Error());
+                        }
+                        catch { }
+                    }
                 }
                 return 0;
             }

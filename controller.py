@@ -4460,6 +4460,31 @@ def _shell_backspace_byte(client_os):
     return b'\x08'
 
 
+def _shell_windows_stdin_bytes(data, client_os=None):
+    """Translate raw terminal bytes to what a Windows console PTY expects.
+
+    Enter reaches a byte reader as CR or LF (or CRLF); send one CR so a Unix
+    client gets exactly one NL and a Windows console gets exactly one Enter.
+    Both backspace bytes become the destination's erase byte.
+    """
+    out = bytearray()
+    index = 0
+    while index < len(data):
+        byte = data[index]
+        if byte == 0x0d:
+            out.append(0x0d)
+            if index + 1 < len(data) and data[index + 1] == 0x0a:
+                index += 1
+        elif byte == 0x0a:
+            out.append(0x0d)
+        elif byte in (0x08, 0x7f):
+            out += _shell_backspace_byte(client_os)
+        else:
+            out.append(byte)
+        index += 1
+    return bytes(out)
+
+
 def _shell_stdout(data):
     """Portable stdout write - survives redirected stdout."""
     try:
@@ -4500,8 +4525,8 @@ class _ShellInputWriter(object):
     A blocked/proxied tunnel send must never freeze the controller's keyboard
     loop: while a write is stalled the user must still be able to press Ctrl+]
     (or keep seeing client output).  The bounded buffer also stops a huge
-    paste from exhausting memory; Ctrl+C jumps ahead of queued paste so an
-    interrupt is not stuck behind a megabyte of typed text.
+    paste from exhausting memory; Ctrl+C cancels queued input and jumps
+    ahead of a paste, so an interrupt is not stuck behind typed text.
 
     Sends are bounded: a raw socket has SO_SNDTIMEO set by
     _tune_link_socket(), and this thread additionally gives up when no byte
@@ -4526,19 +4551,23 @@ class _ShellInputWriter(object):
     def send(self, data):
         if not data or self.failed.is_set():
             return
-        pieces = data.split(b'\x03')
+        last_ctrl = data.rfind(b'\x03')
         with self._cond:
-            for index, piece in enumerate(pieces):
-                if piece:
-                    room = max(0, self.MAX_PENDING - self._pending)
-                    take = min(len(piece), room)
-                    if take:
-                        self._parts.append(piece[:take])
-                        self._pending += take
-                    if take < len(piece):
-                        self.dropped += len(piece) - take
-                if index != len(pieces) - 1:
-                    self._ctrl = min(self._ctrl + 1, 64)
+            if last_ctrl >= 0:
+                # Ctrl+C cancels the line; discard paste that was queued
+                # before it so old characters do not trail the fresh prompt.
+                self._parts.clear()
+                self._pending = 0
+                self._ctrl = min(self._ctrl + data.count(b'\x03'), 64)
+                data = data[last_ctrl + 1:]
+            if data:
+                room = max(0, self.MAX_PENDING - self._pending)
+                take = min(len(data), room)
+                if take:
+                    self._parts.append(data[:take])
+                    self._pending += take
+                if take < len(data):
+                    self.dropped += len(data) - take
             self._cond.notify()
 
     def _send_all(self, data):
@@ -4628,6 +4657,10 @@ PTY normally erases with 0x7f, a Windows console with 0x08."""
             pass
         writer = _ShellInputWriter(conn)
         normalizer = _CRLFNormalizer()
+        if client_os == 'windows':
+            # A Windows client's ConPTY may have drawn its prompt before this
+            # channel was ready; one Enter makes it redraw immediately.
+            writer.send(b'\r')
         while True:
             if writer.failed.is_set():
                 break
@@ -4643,7 +4676,10 @@ PTY normally erases with 0x7f, a Windows console with 0x08."""
                     print("\n[+] Shell session closed (Ctrl+]).")
                     break
                 if client_os == 'windows':
-                    data = data.replace(b'\x7f', _shell_backspace_byte('windows'))
+                    # Also collapse CRLF and lone LF: a Unix paste can carry
+                    # either, and two line endings would submit an extra empty
+                    # command to the Windows console.
+                    data = _shell_windows_stdin_bytes(data, client_os)
                 elif client_os:
                     data = data.replace(b'\x08', _shell_backspace_byte(client_os))
                 writer.send(data)
@@ -4673,6 +4709,166 @@ PTY normally erases with 0x7f, a Windows console with 0x08."""
             pass
 
 
+def _windows_stdin_usable():
+    """Windows: stdin is a console or pipe, not a redirected disk file.
+
+    Native Windows Python sees MinTTY's stdin as a pipe, so isatty() is
+    False even though keystrokes are available.  Allowing FILE_TYPE_CHAR
+    and FILE_TYPE_PIPE lets that setup reach the stdin byte reader, while
+    still rejecting `controller.py < script.txt` (FILE_TYPE_DISK).
+    """
+    try:
+        import ctypes
+        import msvcrt
+
+        handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+        if handle == -1:
+            return False
+        k32 = ctypes.windll.kernel32
+        k32.GetFileType.argtypes = [ctypes.c_void_p]
+        k32.GetFileType.restype = ctypes.c_uint32
+        return k32.GetFileType(handle) in (2, 3)   # FILE_TYPE_CHAR / PIPE
+    except Exception:
+        return False
+
+
+def _interactive_stdin_ok():
+    """True when the controller has an input source a shell can use."""
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            return True
+    except (AttributeError, OSError, ValueError):
+        pass
+    return os.name == 'nt' and _windows_stdin_usable()
+
+
+def _shell_session_windows_stdin(conn, client_os=None):
+    """Windows fallback for a non-console stdin (MSYS2/MinTTY, redirection).
+
+    msvcrt.kbhit() only works with a real Win32 console input handle.  Inside
+    MinTTY, or when stdin is redirected, GetConsoleMode() fails and the key
+    loop would spin forever with a blank screen.  Read raw bytes from file
+    descriptor 0 instead; the client's PTY still performs the echo, so the
+    controller must not echo locally.
+    """
+    import ctypes
+    import msvcrt
+
+    stop = threading.Event()
+    writer = _ShellInputWriter(conn)
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        print("\n[!] The shell needs readable stdin.")
+        writer.close()
+        return
+    old_mode = None
+    try:
+        # Stop the CRT from translating CR/LF or treating Ctrl+Z as EOF.
+        # Remember the old mode: fd 0 is shared with the controller prompt
+        # that takes over after the shell session ends.
+        old_mode = msvcrt.setmode(fd, os.O_BINARY)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+    k32 = ctypes.windll.kernel32
+    k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    k32.WaitForSingleObject.restype = ctypes.c_uint32
+    k32.PeekNamedPipe.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+    k32.PeekNamedPipe.restype = ctypes.c_int
+    try:
+        in_handle = msvcrt.get_osfhandle(fd)
+    except (AttributeError, OSError, ValueError):
+        in_handle = None
+
+    def pump():
+        try:
+            while not stop.is_set():
+                data = conn.recv(RECV_CHUNK)
+                if not data:                # shell exited on the client
+                    break
+                _shell_stdout(data)
+        except (OSError, ValueError):
+            pass
+        finally:
+            stop.set()
+
+    def read_keys():
+        try:
+            while not stop.is_set():
+                if in_handle is not None:
+                    # Peek first, then read exactly the bytes already
+                    # available.  A blocking os.read() on a Windows pipe
+                    # cannot be interrupted: after Ctrl+] that thread would
+                    # stay parked and steal keystrokes from the controller
+                    # prompt that takes over next.
+                    available = ctypes.c_uint32(0)
+                    if not k32.PeekNamedPipe(
+                            in_handle, None, 0, None,
+                            ctypes.byref(available), None):
+                        break               # pipe closed / not a pipe
+                    if available.value == 0:
+                        stop.wait(0.05)
+                        continue
+                    data = os.read(fd, min(4096, available.value))
+                else:
+                    data = os.read(fd, 4096)
+                if not data:
+                    break
+                if SHELL_ESCAPE in data:    # Ctrl+]: leave from this side
+                    before = data.split(SHELL_ESCAPE, 1)[0]
+                    if before:
+                        writer.send(_shell_windows_stdin_bytes(before,
+                                                               client_os))
+                    _shell_stdout(b"\r\n[+] Shell session closed (Ctrl+]).\r\n")
+                    break
+                writer.send(_shell_windows_stdin_bytes(data, client_os))
+        except (OSError, ValueError):
+            pass
+        finally:
+            stop.set()
+
+    out_thread = threading.Thread(target=pump, daemon=True,
+                                  name='shell-output')
+    out_thread.start()
+    key_thread = threading.Thread(target=read_keys, daemon=True,
+                                  name='shell-keys')
+    key_thread.start()
+    # Force the client to redraw its prompt even if the first frame was
+    # produced before this terminal was ready.  Only Windows clients need
+    # it; a Unix login shell already draws its own prompt.
+    if client_os == 'windows':
+        writer.send(b'\r')
+    try:
+        while not stop.is_set() and not writer.failed.is_set():
+            stop.wait(0.2)
+    except KeyboardInterrupt:
+        # A non-console terminal may still deliver Ctrl+C as a signal; pass
+        # it on as keystrokes instead of leaving the remote shell.
+        writer.send(b'\x03')
+        while not stop.is_set() and not writer.failed.is_set():
+            stop.wait(0.2)
+    finally:
+        stop.set()
+        writer.close()
+        # The reader notices stop within one WaitForSingleObject tick; join
+        # briefly so restoring the CRT mode cannot race a pending read.
+        try:
+            key_thread.join(0.5)
+        except Exception:
+            pass
+        if old_mode is not None:
+            try:
+                msvcrt.setmode(fd, old_mode)
+            except (OSError, ValueError):
+                pass
+        if writer.dropped:
+            print("\n[i] Dropped {} bytes of shell input: the link was "
+                  "slower than the paste.".format(writer.dropped))
+
+
 def _shell_session_windows(conn, client_os=None):
     """Windows console equivalent: read keys with msvcrt, print the replies.
 
@@ -4683,17 +4879,34 @@ and 0x08 for Windows ones."""
     import msvcrt
 
     k32 = ctypes.windll.kernel32
-    handle = k32.GetStdHandle(-10)              # STD_INPUT_HANDLE
+    # Declare the 64-bit handle signatures explicitly: ctypes defaults to a
+    # 32-bit int return and 32-bit integer arguments, which can truncate a
+    # console handle and make GetConsoleMode/SetConsoleMode fail or touch the
+    # wrong handle.
+    k32.GetStdHandle.argtypes = [ctypes.c_uint32]
+    k32.GetStdHandle.restype = ctypes.c_void_p
+    k32.GetConsoleMode.argtypes = [ctypes.c_void_p,
+                                   ctypes.POINTER(ctypes.c_uint32)]
+    k32.GetConsoleMode.restype = ctypes.c_int
+    k32.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    k32.SetConsoleMode.restype = ctypes.c_int
+
+    handle = k32.GetStdHandle(0xFFFFFFF6)       # STD_INPUT_HANDLE (-10)
     mode = ctypes.c_uint()
-    k32.GetConsoleMode(handle, ctypes.byref(mode))
+    if not handle or not k32.GetConsoleMode(handle, ctypes.byref(mode)):
+        # MinTTY/MSYS2, a pipe, or any other redirected stdin: there is no
+        # console input handle, so msvcrt would never see a keystroke.
+        _shell_session_windows_stdin(conn, client_os)
+        return
     # Disable ENABLE_PROCESSED_INPUT so Ctrl+C is delivered as input.
     k32.SetConsoleMode(handle, mode.value & ~0x0001)
 
     # Enable ENABLE_VIRTUAL_TERMINAL_PROCESSING on the console so the client's
     # ANSI output (colours, cursor moves, clear screen) renders properly.
-    out_handle = k32.GetStdHandle(-11)          # STD_OUTPUT_HANDLE
+    out_handle = k32.GetStdHandle(0xFFFFFFF5)   # STD_OUTPUT_HANDLE (-11)
     out_mode = ctypes.c_uint()
-    vt_enabled = bool(k32.GetConsoleMode(out_handle, ctypes.byref(out_mode)))
+    vt_enabled = bool(out_handle and
+                      k32.GetConsoleMode(out_handle, ctypes.byref(out_mode)))
     if vt_enabled:
         k32.SetConsoleMode(out_handle, out_mode.value | 0x0004)
 
@@ -4713,6 +4926,11 @@ and 0x08 for Windows ones."""
             stop.set()
 
     threading.Thread(target=pump, daemon=True).start()
+    # Redraw the prompt in case the client produced its first frame before
+    # this console was ready; a lone CR is Enter on both clients.  Only a
+    # Windows client needs the nudge.
+    if client_os == 'windows':
+        writer.send(b'\r')
 
     # Windows scan codes -> ANSI escape sequences
     arrow_map = {
@@ -4788,7 +5006,7 @@ and through a Pinggy/ngrok TCP or HTTP tunnel.  Type 'exit' (or Ctrl+D) in
 that shell to return to this prompt; press Ctrl+] here to force it closed.
 Returns False only when the client's main connection is gone."""
     global SHELL_ACTIVE
-    if not sys.stdin.isatty():
+    if not _interactive_stdin_ok():
         print("[!] The interactive shell needs a real terminal (stdin is not a TTY).")
         return True
     STOP_REQUEST.clear()                # a stray Ctrl+Z must not stop a later job
@@ -6820,13 +7038,90 @@ def _gui_term_text(text):
     understands: \\x01 = EL (cut the line at the cursor), \\x02 = ED (clear
     the screen).  \\r, \\b and \\t survive verbatim - they are what makes
     echo, backspace and column-aligned output behave like a real terminal
-    instead of one div per network chunk."""
+    instead of one div per network chunk.
+
+    This one-shot form is only safe for text that never splits an escape
+    sequence.  Shell output arrives as network chunks and Windows ConPTY
+    emits a dense stream of short escapes that straddle chunk boundaries
+    constantly, so GuiShell feeds its chunks through _gui_term_feed()."""
     if '\x1b' in text:
         for el in ('\x1b[0K', '\x1b[K'):
             text = text.replace(el, '\x01')
         for ed in ('\x1b[0J', '\x1b[J', '\x1b[1J', '\x1b[2J'):
             text = text.replace(ed, '\x02')
     return _gui_ansi_strip(text).replace('\x00', '')
+
+
+# Complete CSI sequences the browser terminal model understands as sentinels.
+_GUI_EL_SEQS = ('\x1b[K', '\x1b[0K')
+_GUI_ED_SEQS = ('\x1b[J', '\x1b[0J', '\x1b[1J', '\x1b[2J')
+_GUI_MAX_PEND = 512          # a malformed sequence may never wedge the stream
+
+
+def _gui_term_feed(state, text):
+    """Chunk-boundary-safe _gui_term_text().
+
+    state is a dict owned by one shell session and carries a partial escape
+    sequence from the previous chunk.  ConPTY (Windows) writes its frame as
+    many tiny writes, so a CSI or OSC is regularly split across two recv()
+    chunks; a per-chunk stripper turned the fragments into visible garbage
+    ('[3J', '[H', the window title text...) and an unterminated OSC swallowed
+    the rest of its chunk - the Windows browser shell showed nothing useful.
+    Complete sequences are sanitized exactly like _gui_term_text() does."""
+    text = state.pop('pend', '') + text
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch != '\x1b':
+            out.append(ch)
+            i += 1
+            continue
+        j = i + 1
+        if j >= n:                      # bare ESC: its tail is in the next chunk
+            state['pend'] = '\x1b'
+            break
+        nxt = text[j]
+        if nxt == '[':                  # CSI ... final byte in @..~
+            k = j + 1
+            while k < n and not ('@' <= text[k] <= '~'):
+                k += 1
+            if k >= n:
+                state['pend'] = text[i:]
+                break
+            seq = text[i:k + 1]
+            if seq in _GUI_EL_SEQS:
+                out.append('\x01')
+            elif seq in _GUI_ED_SEQS:
+                out.append('\x02')
+            i = k + 1
+            continue
+        if nxt == ']':                  # OSC ... BEL or ESC \
+            k = j + 1
+            while k < n:
+                c = text[k]
+                if c == '\x07':
+                    k += 1
+                    break
+                if c == '\x1b':
+                    if k + 1 < n and text[k + 1] == '\\':
+                        k += 2
+                    break               # ST, or an abandoned OSC: reprocess ESC
+                k += 1
+            else:
+                state['pend'] = text[i:]    # still open at the end of the chunk
+                break
+            i = k
+            continue
+        i = j + 1                       # two-byte escape (ESC 7, ESC c, ...)
+    pend = state.get('pend')
+    if pend and len(pend) > _GUI_MAX_PEND:
+        # A sequence that never finished is malformed: drop it instead of
+        # holding the terminal's output back forever.
+        state['pend'] = ''
+        out.insert(0, _gui_ansi_strip(pend))
+    return ''.join(out).replace('\x00', '')
 
 
 def _gui_ansi_strip(text):
@@ -6879,6 +7174,7 @@ class GuiShell(object):
         self.client_os = ''
         self.out = []
         self._pend = b''                # a UTF-8 character split mid-chunk
+        self._esc = {}                  # an escape sequence split mid-chunk
         self.version = 1
 
     def snapshot(self):
@@ -6921,7 +7217,7 @@ class GuiShell(object):
                     data = data[start + 1:]
             if not text:
                 continue
-            text = _gui_term_text(text)
+            text = _gui_term_feed(self._esc, text)
             if not text:
                 continue
             with self.lock:
@@ -6949,12 +7245,14 @@ class GuiShell(object):
             self.client_os = client_os or ''
             self.out = []
             self._pend = b''
+            self._esc = {}
             self.version += 1
 
     def detach(self):
         with self.lock:
             self.conn = None
             self._pend = b''
+            self._esc = {}
             self.version += 1
 
     def stop(self):
