@@ -12,6 +12,7 @@
 import base64
 import glob
 import hashlib
+from collections import deque
 from http import server as http_server
 import io
 import ipaddress
@@ -228,21 +229,38 @@ def recv_msg(conn, deadline=None):
         return None
 
 
+def _recv_header(conn):
+    """Read the 4-byte length header, usually in one recv().
+
+    An idle client is normal, so the first byte may wait forever.  Once the
+    header starts, a peer that sends a byte and then stops must not hold the
+    reader: the remainder is bounded by a short deadline.  Reading 1 + 3 bytes
+    cost two recv()s and a select() on every single message; the common case is
+    now one recv(4), which matters for command replies, shell keystrokes and
+    screen frames alike."""
+    try:
+        data = conn.recv(4)
+    except OSError:
+        return None
+    if not data:
+        return None
+    if len(data) == 4:
+        return data
+    rest = recv_exact(conn, 4 - len(data), deadline=time.time() + 10)
+    if rest is None:
+        return None
+    return data + rest
+
+
 def recv_any(conn):
     """Read one message from the client: a JSON dict, or a screen-share frame
 (marked with b'\\x01') as {'type': 'frame', 'jpeg': ...}. None = the
 connection is gone or the stream is out of sync."""
     try:
-        # The first byte may take forever (an idle client is normal). Once a
-        # message has started, the remaining bytes have to arrive: a peer that
-        # sends a header and then stops must not hold the reader forever.
-        first = recv_exact(conn, 1)
-        if first is None:
+        header = _recv_header(conn)
+        if header is None:
             return None
-        rest = recv_exact(conn, 3, deadline=time.time() + 10)
-        if rest is None:
-            return None
-        size = int.from_bytes(first + rest, 'big')
+        size = int.from_bytes(header, 'big')
         if size > MAX_MSG:
             return None
         payload = recv_exact(conn, size, stall_timeout=RECV_STALL_TIMEOUT)
@@ -3084,6 +3102,14 @@ _WINDOWS_RESERVED_NAMES = (
     | {'COM{}'.format(i) for i in range(1, 10)}
     | {'LPT{}'.format(i) for i in range(1, 10)})
 
+# One C-level translate() replaces the per-character Python loop; this runs
+# once per entry of every uploaded/downloaded folder.
+_TRANSFER_PATH_BAD = {ord(c): '_' for c in '<>:"|?*'}
+for _code in range(32):
+    _TRANSFER_PATH_BAD[_code] = '_'
+_TRANSFER_PATH_BAD[0x7f] = '_'
+del _code
+
 
 def _safe_transfer_rel(value):
     """Return a portable, relative path safe for a remote receiver.
@@ -3108,13 +3134,7 @@ def _safe_transfer_rel(value):
         # characters.  Backslash is already a separator; colon would create an
         # alternate data stream.  This also keeps a Linux -> Windows transfer
         # from failing halfway through a folder with such a name.
-        cleaned = []
-        for char in part:
-            if char in '<>:"|?*' or ord(char) < 32 or char == '\x7f':
-                cleaned.append('_')
-            else:
-                cleaned.append(char)
-        part = ''.join(cleaned).rstrip(' .')
+        part = part.translate(_TRANSFER_PATH_BAD).rstrip(' .')
         if not part:
             continue
         stem = part.split('.', 1)[0].upper()
@@ -3166,22 +3186,53 @@ def _scan_transfer_tree(path, top_name=None, cancel=None):
     seen = set()
     total_files = 0
     total_bytes = 0
-    for base, dirnames, filenames in os.walk(source, followlinks=False):
-        if stopped():
-            return None
-        rel_base = os.path.relpath(base, source)
-        rel_parent = None if rel_base == '.' else _safe_transfer_rel(rel_base)
-        if rel_base != '.' and not rel_parent:
-            warnings.append('skipped unsafe folder {}'.format(rel_base))
-            dirnames[:] = []
-            continue
-        # os.walk does not follow directory links when followlinks=False but
-        # still lists them in dirnames; remove them so they do not appear as
-        # empty remote directories (and are not descended into).
+
+    def walk(base, rel_parent):
+        """Depth-first and sorted exactly like os.walk(), but each directory
+        entry is stat'ed at most once.
+
+        os.walk() already calls scandir, and the old body then called
+        os.path.islink() plus os.lstat() for every file: three filesystem
+        lookups per entry.  DirEntry carries the same data from one scandir,
+        so a huge folder is O(n) with a much smaller constant.
+        """
+        nonlocal total_files, total_bytes
+        try:
+            with os.scandir(base) as scan:
+                dirs = []
+                files_here = []
+                for entry in scan:
+                    try:
+                        is_dir = entry.is_dir()      # follows links, like os.walk
+                    except OSError:
+                        is_dir = False
+                    if is_dir:
+                        try:
+                            is_link = entry.is_symlink()
+                        except OSError:
+                            is_link = False
+                        dirs.append((entry.name, entry.path, is_link))
+                        continue
+                    try:
+                        is_link = entry.is_symlink()
+                    except OSError:
+                        is_link = False
+                    info = error = None
+                    if not is_link:
+                        try:
+                            info = entry.stat(follow_symlinks=False)
+                        except OSError as exc:
+                            error = exc
+                    files_here.append((entry.name, entry.path, is_link, info, error))
+        except OSError:
+            return True                  # os.walk(onerror=None) silently skips it
         kept = []
-        for name in sorted(dirnames):
-            full = os.path.join(base, name)
-            if os.path.islink(full):
+        for name, full, is_link in sorted(dirs, key=lambda item: item[0]):
+            if stopped():
+                return False
+            # A directory link is never followed (followlinks=False) and must
+            # not appear as an empty remote folder.
+            if is_link:
                 warnings.append('skipped symlink {}'.format(full))
                 continue
             rel = _safe_transfer_rel(
@@ -3194,19 +3245,16 @@ def _scan_transfer_tree(path, top_name=None, cancel=None):
                 continue
             seen.add(rel)
             entries.append({'path': rel, 'kind': 'dir'})
-            kept.append(name)
-        dirnames[:] = kept
-        for name in sorted(filenames):
+            kept.append((full, rel))
+        for name, full, is_link, info, error in sorted(
+                files_here, key=lambda item: item[0]):
             if stopped():
-                return None
-            full = os.path.join(base, name)
-            if os.path.islink(full):
+                return False
+            if is_link:
                 warnings.append('skipped symlink {}'.format(full))
                 continue
-            try:
-                info = os.lstat(full)
-            except OSError as e:
-                warnings.append('skipped {}: {}'.format(full, e))
+            if error is not None:
+                warnings.append('skipped {}: {}'.format(full, error))
                 continue
             if not stat.S_ISREG(info.st_mode):
                 warnings.append('skipped special file {}'.format(full))
@@ -3226,6 +3274,13 @@ def _scan_transfer_tree(path, top_name=None, cancel=None):
             files.append((rel, full, int(info.st_size), mode))
             total_files += 1
             total_bytes += int(info.st_size)
+        for full, rel in kept:
+            if not walk(full, rel):
+                return False
+        return True
+
+    if not walk(source, None):
+        return None
     if stopped():
         return None
     return {'source': source, 'kind': 'dir', 'root': root, 'entries': entries,
@@ -4655,7 +4710,7 @@ class _ShellInputWriter(object):
         self.failed = threading.Event()
         self.dropped = 0
         self._cond = threading.Condition()
-        self._parts = []                 # queued keystroke chunks (FIFO)
+        self._parts = deque()            # queued keystroke chunks (FIFO)
         self._pending = 0                # bytes in _parts
         self._ctrl = 0                   # pending Ctrl+C presses (priority)
         self.thread = threading.Thread(target=self._run,
@@ -4719,7 +4774,7 @@ class _ShellInputWriter(object):
                     self._ctrl -= 1
                     data = b'\x03'
                 else:
-                    data = self._parts.pop(0)
+                    data = self._parts.popleft()
                     self._pending -= len(data)
             try:
                 ok = self._send_all(data)
@@ -5346,7 +5401,7 @@ raw=True leaves backspaces in the text for the caller's line buffer."""
         return ''
 
 
-QUEUED_COMMANDS = []              # commands typed while waiting for a client
+QUEUED_COMMANDS = deque()         # commands typed while waiting for a client
 WAIT_FRAGMENT = ''                # partial line from _poll_waiting_lines
 
 
@@ -5397,7 +5452,7 @@ instead of being executed on the replacement session."""
     global PENDING_INPUT, PROMPT_ACTIVE, LIVE_PROMPT
     flush_async()                       # show what the background produced
     if QUEUED_COMMANDS:
-        text = QUEUED_COMMANDS.pop(0)
+        text = QUEUED_COMMANDS.popleft()
         print("{}{}".format(prompt, text))
         return text
     PROMPT_ACTIVE = True
@@ -7840,7 +7895,7 @@ def _accept_loop(server_socket, tls_context=None):
 GUI_SETTINGS = {'enabled': True, 'host': '127.0.0.1', 'port': 8080,
                 'token': ''}
 GUI_STATE = None                  # GuiDashboard, created by start_gui_dashboard()
-GUI_PENDING_COMMANDS = []         # browser-submitted commands, waiting
+GUI_PENDING_COMMANDS = deque()    # browser-submitted commands, waiting
 GUI_CMD_LOCK = threading.Lock()
 GUI_CMD_COND = threading.Condition()   # wakes the browser-command dispatcher
 
@@ -8585,7 +8640,7 @@ waits its turn (and vice versa)."""
         with GUI_CMD_COND:
             while not GUI_PENDING_COMMANDS:
                 GUI_CMD_COND.wait(0.5)
-            line = GUI_PENDING_COMMANDS.pop(0)
+            line = GUI_PENDING_COMMANDS.popleft()
         try:
             link = _active_link()
             if link is None or link.dead:
@@ -8624,12 +8679,12 @@ prompt, exactly like a command typed into the waiting terminal."""
 
 def _drain_gui_commands():
     """Browser-submitted commands waiting for the prompt (when the GUI is
-    off this is always [], so the hot paths stay untouched)."""
+    off this is always empty, so the hot paths stay untouched)."""
     if not GUI_PENDING_COMMANDS:
         return []
     with GUI_CMD_LOCK:
-        pending = GUI_PENDING_COMMANDS[:]
-        del GUI_PENDING_COMMANDS[:]
+        pending = list(GUI_PENDING_COMMANDS)
+        GUI_PENDING_COMMANDS.clear()
     return pending
 
 
@@ -11866,7 +11921,10 @@ def main():
         print("[!] Stop it with:  kill <PID>")
         return
 
-    server_socket.listen(64)
+    # A deeper backlog absorbs a burst of reconnecting clients (for example
+    # every client at once after a network blip) without the kernel dropping
+    # SYNs, which the clients would then have to retry with a delay.
+    server_socket.listen(128)
     print("[+] Controller v20 listening on port {} ({})".format(
         PORT, _http_connection_name()))
     print("[i] One port now accepts everything automatically: raw TCP, direct TLS,")
