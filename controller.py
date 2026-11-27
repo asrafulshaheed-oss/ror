@@ -818,7 +818,10 @@ def _half_down_loop(sock, session, chunked):
         next_heartbeat = time.monotonic() + 15
         while not session._closed:
             try:
-                item = session.out_q.get_nowait()
+                # Block on the queue, not on get_nowait()+select(0.5): a frame
+                # ack placed here while the stream is live must go out
+                # immediately.  The 0.5 s wait is only the idle EOF probe.
+                item = session.out_q.get(timeout=0.5)
             except queue.Empty:
                 # A write-only loop cannot see the client closing /down.  Poll
                 # for EOF so ending a shell (or closing the client) promptly
@@ -2014,10 +2017,13 @@ CLIENT_ENV = {}          # environment report of the active client (hello)
 # switches. This is controller-side only - the client, the protocol, the
 # request ids and the command hot paths are untouched, so nothing gets slower.
 SESSIONS = {}            # number -> ClientLink (live sessions)
+INSTANCE_LINKS = {}      # client instance id -> its current ClientLink
+INSTANCE_NUMBERS = {}    # instance id -> (last session number, last seen)
+INSTANCE_NUMBER_LIMIT = 512
 SESSIONS_COND = threading.Condition()
 CURRENT_LINK = [None]    # the session commands are sent to (None = no client)
 TRANSFER_SERIAL = itertools.count(1)   # stable numbers shown by 'cancel'
-SESSION_COUNTER = [0]    # monotonic session numbers; a number is never reused
+SESSION_COUNTER = [0]    # monotonic session numbers; a resume keeps its number
 STOPPING = False         # the controller is exiting: no disconnect notices
 KEEPALIVE_IDLE = 5       # notice a powered-off client/VM in ~15 seconds
 KEEPALIVE_INTERVAL = 3
@@ -2331,7 +2337,15 @@ every few seconds used to hold the only accept thread for minutes."""
         except OSError:
             pass
     if isinstance(msg, dict) and msg.get('type') == 'hello':
-        features = {'frame_ack': bool(msg.get('frame_ack'))}
+        instance = msg.get('instance')
+        if not isinstance(instance, str):
+            instance = ''
+        instance = instance.strip()
+        if (len(instance) > 128
+                or any(not (ch.isalnum() or ch in '_.-') for ch in instance)):
+            instance = ''          # ignore hostile/unusable ids
+        features = {'frame_ack': bool(msg.get('frame_ack')),
+                    'instance': instance}
         return _sanitize_env(msg.get('env') or {}), features
     return (None if require else {}), {}
 
@@ -2887,11 +2901,26 @@ stream so the controller's own browser can watch the client's screen."""
 
             def do_GET(self):
                 if self.path.startswith('/stream'):
+                    # Keep this side of the MJPEG stream from becoming another
+                    # multi-second buffer.  A small send buffer holds at most
+                    # one or two frames, and TCP_NODELAY avoids Nagle delays.
+                    try:
+                        self.connection.setsockopt(
+                            socket.SOL_SOCKET, socket.SO_SNDBUF, 128 * 1024)
+                    except OSError:
+                        pass
+                    try:
+                        self.connection.setsockopt(
+                            socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    except OSError:
+                        pass
                     self.send_response(200)
                     self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
                     self.send_header('Cache-Control', 'no-store')
                     self.end_headers()
-                    self.connection.settimeout(15)
+                    # A browser tab that stops reading must not hold a frame
+                    # for 15 s; close that one viewer instead.
+                    self.connection.settimeout(5)
                     last = -1
                     try:
                         while not viewer.stop_requested:
@@ -2900,16 +2929,19 @@ stream so the controller's own browser can watch the client's screen."""
                                         lambda: viewer.seq != last or viewer.stop_requested,
                                         timeout=1.0):
                                     continue    # no new frame: never resend the same one
+                                # Always publish the newest picture.  If more
+                                # frames arrived while the previous write was
+                                # blocked, the old ones are dropped, not queued.
                                 last = viewer.seq
                                 frame = viewer.jpeg
                             if frame is None:
                                 continue
-                            self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '
-                                             + str(len(frame)).encode() + b'\r\n\r\n')
-                            self.wfile.write(frame)
-                            self.wfile.write(b'\r\n')
-                    except OSError:
-                        pass        # browser tab closed
+                            self.wfile.write(
+                                b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '
+                                + str(len(frame)).encode() + b'\r\n\r\n'
+                                + frame + b'\r\n')
+                    except (OSError, socket.timeout):
+                        pass        # browser tab closed or stopped reading
                     return
                 if self.path.startswith('/stop'):
                     viewer.stop_requested = True
@@ -3608,7 +3640,13 @@ Ctrl+Z cancels it on the client."""
                 self.succeeded = (mtype == 'output')
                 self.done.set()
             else:
-                self.succeeded = (mtype == 'output')
+                # A upex reply is a normal 'output' even when the app failed;
+                # its exit_code is the authoritative success signal.  Without
+                # this, '-all' reported every target as done.
+                code = msg.get('exit_code')
+                failed = (mtype != 'output'
+                          or (isinstance(code, int) and code != 0))
+                self.succeeded = not failed
             self.link.say(text)
             self.done.set()
             return True
@@ -3685,6 +3723,17 @@ Ctrl+Z cancels it on the client."""
         if self.kind != 'screenshare':
             return False
         self.frames += 1
+        if self.link.frame_ack:
+            # Acknowledge before touching the viewer: this tiny reverse-channel
+            # credit signal is what keeps the client from queueing seconds of
+            # stale frames behind a slow browser/tunnel.  The count is this
+            # operation's own frame count, so a late ack from an older share
+            # can never grant credit to a newer one.
+            try:
+                self.link.send({'type': 'frame_ack', 'id': self.id,
+                                'seq': self.frames})
+            except OSError:
+                self.link.mark_lost()
         jpeg = msg.get('jpeg')
         if not isinstance(jpeg, (bytes, bytearray)):
             # A malformed frame cannot become a JPEG; ignore it instead of
@@ -3710,15 +3759,6 @@ Ctrl+Z cancels it on the client."""
         if not self.viewer_announced:
             self.viewer_announced = True
             self.link.say(_capture_text(announce_viewer, viewer, self.seconds))
-        if self.link.frame_ack:
-            # Tiny reverse-channel credit signal.  It lets the client keep at
-            # most a few frames in flight instead of queueing seconds of stale
-            # images when the tunnel is slow.
-            try:
-                self.link.send({'type': 'frame_ack', 'id': self.id,
-                                'seq': self.frames})
-            except OSError:
-                self.link.mark_lost()
         if viewer.stop_requested:           # the Stop button in the page
             self.ask_stop()
         elif self.seconds and (time.time() - self.stream_start) >= self.seconds:
@@ -3958,7 +3998,9 @@ the order their answers arrive in."""
         self.addr = addr
         self.number = None              # session number, assigned on accept
         self.env = {}                   # this client's hello (for 'session')
-        self.frame_ack = False          # new client + full-duplex transport
+        self.instance = ''              # stable id from hello (reconnect resume)
+        self.resumed = False            # replaced an older link of the same client
+        self.frame_ack = False          # controller may ack every consumed frame
         self.on_dead = None             # registry hook: this session went away
         self.lock = threading.Lock()
         self.send_lock = threading.Lock()   # the reader thread can send too
@@ -4145,12 +4187,6 @@ def _active_link():
     return CURRENT_LINK[0]
 
 
-def _next_session_number():
-    with SESSIONS_COND:
-        SESSION_COUNTER[0] += 1
-        return SESSION_COUNTER[0]
-
-
 def _session_env_label(link):
     """A short one-line description of a session's machine."""
     env = link.env or {}
@@ -4168,18 +4204,90 @@ def _session_env_label(link):
 
 def _register_link(link):
     """Add an accepted link to the session list. Returns True when it became
-the active session (the caller's prompt then shows the help)."""
+the active session (the caller's prompt then shows the help).
+
+A client that reconnects with the same instance id resumes its old session
+instead of opening a new one.  The stale link is retired *after* the lock and
+without its on_dead callback, so it cannot make another session active or
+print a second disconnect notice.  This fixes both the delayed first
+connection (new link stuck behind a half-dead old link) and the
+"screenshare opens session 3" report.
+"""
     global CLIENT_ENV
     became_active = False
+    previous = None
     with SESSIONS_COND:
-        if link.dead or link.number is None:
+        if link.dead:
             return False
+        if link.number is None:
+            remembered = (INSTANCE_NUMBERS.get(link.instance)
+                          if link.instance else None)
+            if link.instance:
+                previous = INSTANCE_LINKS.get(link.instance)
+                if previous is link:
+                    previous = None
+                if previous is not None and previous.dead:
+                    previous = None
+                if previous is None and remembered:
+                    # The registry callback may not have run yet: a dead link
+                    # can still occupy its number (and the active slot).  It is
+                    # still this client's old link, so resume it instead of
+                    # opening a new inactive session behind the stale one.
+                    occupant = SESSIONS.get(remembered[0])
+                    if (occupant is not None
+                            and occupant.instance == link.instance):
+                        previous = occupant
+            if previous is not None and previous.number is not None:
+                # Keep the number the user already knows (and any browser tab
+                # that still points at that session).
+                link.number = previous.number
+                link.resumed = True
+                if SESSIONS.get(previous.number) is previous:
+                    del SESSIONS[previous.number]
+            elif remembered:
+                # The old link may already have been reaped by _link_died.
+                # Remember the number beyond the connection so a quick
+                # reconnect still resumes session 2 instead of creating 3.
+                number = remembered[0]
+                occupant = SESSIONS.get(number)
+                if occupant is None or (occupant.instance == link.instance
+                                        and occupant.dead):
+                    if occupant is not None:
+                        del SESSIONS[number]
+                    link.number = number
+                    link.resumed = True
+            if link.number is None:
+                # Never overwrite a live session if a remembered number was
+                # rejected or a fake/old client left the counter behind.
+                while True:
+                    SESSION_COUNTER[0] += 1
+                    if SESSION_COUNTER[0] not in SESSIONS:
+                        break
+                link.number = SESSION_COUNTER[0]
         SESSIONS[link.number] = link
-        if CURRENT_LINK[0] is None:
+        if link.instance:
+            INSTANCE_LINKS[link.instance] = link
+            INSTANCE_NUMBERS[link.instance] = (link.number, time.monotonic())
+            if len(INSTANCE_NUMBERS) > INSTANCE_NUMBER_LIMIT:
+                # Bound a long-lived controller's memory; live instances keep
+                # their entry because their link is in INSTANCE_LINKS.
+                stale = [key for key in INSTANCE_NUMBERS
+                         if key not in INSTANCE_LINKS]
+                excess = len(INSTANCE_NUMBERS) - INSTANCE_NUMBER_LIMIT
+                for key in sorted(stale,
+                                  key=lambda k: INSTANCE_NUMBERS[k][1])[:excess]:
+                    INSTANCE_NUMBERS.pop(key, None)
+        was_active = previous is not None and CURRENT_LINK[0] is previous
+        if CURRENT_LINK[0] is None or was_active:
             CURRENT_LINK[0] = link
             CLIENT_ENV = link.env or {}
             became_active = True
         SESSIONS_COND.notify_all()
+    if previous is not None:
+        # Suppress its "Client disconnected." note and its registry callback:
+        # the replacement is already registered and active.
+        previous.on_dead = None
+        previous.close()
     return became_active
 
 
@@ -4192,6 +4300,10 @@ def _link_died(link):
     with SESSIONS_COND:
         if SESSIONS.get(link.number) is link:
             del SESSIONS[link.number]
+        if link.instance and INSTANCE_LINKS.get(link.instance) is link:
+            # Only the current connection for this client owns the mapping; a
+            # late death of a replaced link must not erase its successor.
+            del INSTANCE_LINKS[link.instance]
         if CURRENT_LINK[0] is link:
             # Oldest *live* session: another one that died but whose callback
             # is still waiting for the lock must not be picked (the user would
@@ -4361,6 +4473,8 @@ def _shutdown_sessions():
     with SESSIONS_COND:
         links = list(SESSIONS.values())
         SESSIONS.clear()
+        INSTANCE_LINKS.clear()
+        INSTANCE_NUMBERS.clear()
         CURRENT_LINK[0] = None
         SESSIONS_COND.notify_all()
     for link in links:
@@ -5303,10 +5417,19 @@ instead of being executed on the replacement session."""
             PENDING_LINK[0] = None
         text = line.rstrip('\r').strip()
         if origin is not None and link is not None and origin is not link:
-            print("[i] Discarded a command typed for session {} - it "
-                  "disconnected, so it was not sent to session {}.".format(
-                      origin.number, link.number))
-            continue
+            successor = _successor_link(origin)
+            if successor is link:
+                # The same client reconnected while this operation was
+                # running (screenshare/command).  The machine did not change,
+                # so run the typed command on its resumed link instead of
+                # throwing it away.
+                print("[i] Session {} reconnected; running that command on "
+                      "the resumed link.".format(origin.number))
+            else:
+                print("[i] Discarded a command typed for session {} - it "
+                      "disconnected, so it was not sent to session {}.".format(
+                          origin.number, link.number))
+                continue
         print("{}{}".format(prompt, text))
         return text
     PROMPT_ACTIVE = True
@@ -5438,10 +5561,13 @@ def _leave_cbreak(old):
         pass
 
 
-def _handle_keys(typed, op, cancelable=True, backgroundable=True):
+def _handle_keys(typed, op, cancelable=True, backgroundable=True,
+                 ctrl_c_leaves=False):
     """React to what the user typed while an operation runs."""
-    # Ctrl+Z stops the operation; Ctrl+C must do the same here instead of
-    # killing the controller (a running command is not the prompt).
+    # Ctrl+Z stops the operation.  Ctrl+C normally stops it too (a running
+    # command is not the prompt), but for a persistent upex it means "leave
+    # the controller": the app keeps running on the client and only Ctrl+Z /
+    # 'stop' (the id-based cancel) may end it.
     ctrl_c = '\x03' in typed
     stop = STOP_REQUEST.is_set() or '\x1a' in typed or ctrl_c
     background = '\x02' in typed                           # Ctrl+B
@@ -5452,6 +5578,10 @@ def _handle_keys(typed, op, cancelable=True, backgroundable=True):
     if stop:
         if op.background:
             return
+        if ctrl_c and ctrl_c_leaves and '\x1a' not in typed:
+            # Leave the controller without cancelling the upex app.  The
+            # top-level handler closes the links; the client keeps it alive.
+            raise KeyboardInterrupt
         if cancelable:
             op.cancel('Ctrl+C' if ctrl_c else 'Ctrl+Z')
         else:
@@ -5480,13 +5610,15 @@ background threads simply wait for the answer."""
     return 'done'
 
 
-def wait_foreground(op, cancelable=True, backgroundable=True):
+def wait_foreground(op, cancelable=True, backgroundable=True,
+                    ctrl_c_leaves=False):
     """Send one request and wait for its answer.
 
 Returns 'done', 'background' (it is still running - the prompt is free
 again) or 'dead'.  Called from a thread other than the prompt thread (the
 browser GUI dispatcher), it waits quietly instead of taking over the
-keyboard."""
+keyboard.  ``ctrl_c_leaves`` is used by upex: Ctrl+C there leaves the
+controller and does not cancel the app (Ctrl+Z still cancels)."""
     if threading.current_thread() is not threading.main_thread():
         return _wait_op_quiet(op)
     link = op.link
@@ -5511,7 +5643,8 @@ keyboard."""
                     # than the character it erases, so it must be applied to the
                     # real PENDING_INPUT buffer by _type_ahead, not to this batch.
                     typed = _poll_keyboard(raw=True)
-                    _handle_keys(typed, op, cancelable, backgroundable)
+                    _handle_keys(typed, op, cancelable, backgroundable,
+                                 ctrl_c_leaves)
                     if op.done.is_set() or op.background or link.dead:
                         break
                     time.sleep(0.02)
@@ -5538,8 +5671,13 @@ keyboard."""
                         typed = data.decode('utf-8', 'replace')
                     else:
                         watch_stdin = False         # stdin closed: keep waiting
-                _handle_keys(typed, op, cancelable, backgroundable)
+                _handle_keys(typed, op, cancelable, backgroundable,
+                             ctrl_c_leaves)
             except KeyboardInterrupt:
+                if ctrl_c_leaves:
+                    # Ctrl+C on a persistent upex: leave the controller and
+                    # let the app keep running; do not cancel it.
+                    raise
                 if cancelable and not op.background:
                     print("\n[+] Interrupted - stopping the running "
                           "operation on the client...")
@@ -5559,7 +5697,8 @@ keyboard."""
     return 'done'
 
 
-def ask(link, op, request, cancelable=True, backgroundable=True):
+def ask(link, op, request, cancelable=True, backgroundable=True,
+        ctrl_c_leaves=False):
     """Send one request and wait for its answer.
 
     Returns 'done', 'background' (it is still running - the prompt is free
@@ -5573,7 +5712,9 @@ def ask(link, op, request, cancelable=True, backgroundable=True):
         link.drop(op)
         link.mark_lost()
         return 'dead'
-    return wait_foreground(op, cancelable=cancelable, backgroundable=backgroundable)
+    return wait_foreground(op, cancelable=cancelable,
+                           backgroundable=backgroundable,
+                           ctrl_c_leaves=ctrl_c_leaves)
 
 
 def _compact_bytes(value):
@@ -5871,8 +6012,14 @@ def _upex_os_name(link):
     return str(env.get('os') or '').strip().lower()
 
 
-def _upex_detect_type(path, os_name):
-    """Detect a type from the extension, then from file magic/shebang."""
+def _upex_detect_type(path):
+    """Detect a type from the extension, then from file magic/shebang.
+
+    A bare executable is classified as 'bin' regardless of the *active*
+    session's OS.  For '-all' the type must not depend on one target: a Unix
+    executable should still run on the Linux sessions and fail only on Windows.
+    The client applies the final OS check (a 'bin' on Windows is rejected with
+    a clear message)."""
     by_name = _upex_type_from_name(os.path.basename(path))
     if by_name:
         return by_name
@@ -5897,7 +6044,10 @@ def _upex_detect_type(path, os_name):
             return 'js'
         if b'sh' in first:
             return 'sh'
-    if os_name == 'windows':
+    # Only a *bare* executable is the documented extensionless case.  An
+    # unknown extension (notes.txt, data.json) must not be executed as if it
+    # were a Unix binary.
+    if os.path.splitext(os.path.basename(path))[1]:
         return 'unknown'
     return 'bin'
 
@@ -5942,13 +6092,223 @@ def _upex_validate(app_type, os_name, auto_mode):
 
 _UPEX_CANCELED = object()
 
+# Worker threads print per-session upex lines at the same time; serialise the
+# lines so two sessions never interleave inside one message.
+_UPEX_PRINT_LOCK = threading.Lock()
 
-def _upex_upload_one(link, local_path):
-    """Upload one file synchronously and return its sanitized remote name.
+
+def _upex_say(text):
+    """Print one upex line from either the prompt thread or a session worker.
+
+    Uses the async-safe writer so a message never corrupts the live prompt
+    dashboard, exactly like every other background note."""
+    if not text:
+        return
+    with _UPEX_PRINT_LOCK:
+        _async_print(text)
+
+
+def _upex_wait(op, link, group=None):
+    """Wait for one op's answer, safe to call from a session worker.
+
+    ``wait_foreground`` is prompt-thread aware; from a worker it waits quietly
+    and returns 'background' as soon as the op is detached.  An upex *upload*
+    must not stop on Ctrl+B (the app still needs its file), so when a group is
+    given we keep waiting until the op really finishes or is cancelled."""
+    if group is None:
+        # Single-session upex: Ctrl+C leaves the controller (the app is
+        # persistent), Ctrl+Z still cancels the upload.
+        return wait_foreground(op, cancelable=True, backgroundable=False,
+                               ctrl_c_leaves=True)
+    while not op.done.is_set() and not op.canceled and not link.dead:
+        time.sleep(0.02)
+    return 'dead' if link.dead else 'done'
+
+
+class _UpexGroup(object):
+    """Coordinates one parallel multi-session upex run.
+
+    It behaves like an Op for ``wait_foreground``: Ctrl+B detaches the whole
+    group (the prompt comes back while every session keeps uploading and
+    running) and Ctrl+Z cancels it.  Session workers register the ops they
+    create so a key press reaches all of them.  The last worker to finish
+    prints the per-session result line once."""
+
+    def __init__(self, link, targets, announce=True):
+        self.link = link
+        self.total = len(targets)
+        self.announce = announce       # print the per-session result line?
+        self.label = 'upex ({} sessions)'.format(self.total)
+        self.done = threading.Event()
+        self.background = False
+        self.canceled = False
+        self.why = 'Ctrl+Z'
+        self.lock = threading.Lock()
+        self.ops = []
+        self.results = {}
+        self._remaining = self.total
+        self._printed = False
+        for number, target in targets:
+            # A dead target still counts, so the group can complete.
+            self.results[number] = None
+
+    def register(self, op):
+        """Expose a freshly created op to group-wide detach/cancel."""
+        with self.lock:
+            self.ops.append(op)
+            background = self.background
+            canceled = self.canceled
+            why = self.why
+        if canceled:
+            # The key already arrived: cancel this op at once.  link is set
+            # before register(), so the cancel note has somewhere to go.
+            op.cancel(why)
+        elif background and op.kind == 'upex':
+            # Only the running app is backgrounded here; an upload must still
+            # finish so the app it carries can start.
+            op.background = True
+        return op
+
+    def unregister(self, op):
+        with self.lock:
+            if op in self.ops:
+                self.ops.remove(op)
+
+    def detach(self, announce=True):
+        with self.lock:
+            if self.background:
+                return
+            self.background = True
+            ops = list(self.ops)
+        if announce:
+            self.link.say(
+                "[+] Moved to the background: upex on {} session{}. Each "
+                "session keeps uploading and running on its client - 'jobs' "
+                "shows them, 'stop' ends them.".format(
+                    self.total, '' if self.total == 1 else 's'))
+        for op in ops:
+            if op.kind == 'upex':
+                op.detach()
+
+    def cancel(self, why='Ctrl+Z', announce=True):
+        with self.lock:
+            if self.canceled:
+                return
+            self.canceled = True
+            self.background = True      # wait_foreground must stop waiting
+            self.why = why
+            ops = list(self.ops)
+        if announce:
+            self.link.say("[+] {}: stopping upex on {} session{}...".format(
+                why, self.total, '' if self.total == 1 else 's'))
+        for op in ops:
+            op.cancel(why)
+
+    def finish(self, number, status):
+        """Record one session's result; the last one prints the summary."""
+        with self.lock:
+            self.results[number] = status
+            self._remaining -= 1
+            remaining = self._remaining
+        if remaining <= 0:
+            self.done.set()
+            self._print_results()
+
+    def _print_results(self):
+        with self.lock:
+            if self._printed:
+                return
+            self._printed = True
+            if not self.announce:
+                return
+            results = sorted(self.results.items())
+        words = {'done': 'done', 'failed': 'failed',
+                 'disconnected': 'disconnected', 'background': 'running',
+                 'canceled': 'canceled', 'error': 'failed'}
+        _upex_say("[+] upex results: {}".format(', '.join(
+            'session {}: {}'.format(number, words.get(status, status))
+            for number, status in results)))
+
+
+class _UpexChain(object):
+    """Waits for several upex groups of one '&' chain at the same time.
+
+    Each '&' segment keeps its own group (and its own result line), but every
+    segment starts immediately and runs independently.  Ctrl+B backgrounds the
+    whole chain and Ctrl+Z cancels it.  This object mirrors Op for
+    ``wait_foreground``: it only needs done/background/link and the two key
+    methods."""
+
+    def __init__(self, link):
+        self.link = link
+        self.done = threading.Event()
+        self.background = False
+        self.canceled = False
+        self.label = 'upex chain'
+        self.why = 'Ctrl+Z'
+        self.lock = threading.Lock()
+        self.groups = []
+        self._watching = False
+
+    def add(self, group):
+        with self.lock:
+            self.groups.append(group)
+            background = self.background
+            canceled = self.canceled
+            why = self.why
+        if canceled:
+            group.cancel(why, announce=False)
+        elif background:
+            group.detach(announce=False)
+        return group
+
+    def start(self):
+        with self.lock:
+            if self._watching:
+                return
+            self._watching = True
+        threading.Thread(target=self._watch, name='upex-chain', daemon=True).start()
+
+    def _watch(self):
+        while not self.canceled and not self.link.dead:
+            with self.lock:
+                groups = list(self.groups)
+            if groups and all(group.done.is_set() for group in groups):
+                self.done.set()
+                return
+            time.sleep(0.03)
+
+    def detach(self):
+        with self.lock:
+            if self.background:
+                return
+            self.background = True
+            groups = list(self.groups)
+        self.link.say("[+] Moved to the background: every upex in this chain "
+                      "keeps running on its client - 'jobs' shows them, "
+                      "'stop' ends them.")
+        for group in groups:
+            group.detach(announce=False)
+
+    def cancel(self, why='Ctrl+Z'):
+        with self.lock:
+            if self.canceled:
+                return
+            self.canceled = True
+            self.background = True
+            self.why = why
+            groups = list(self.groups)
+        self.link.say("[+] {}: stopping every upex in this chain...".format(why))
+        for group in groups:
+            group.cancel(why, announce=False)
+
+
+def _upex_upload_one(link, local_path, context='', group=None):
+    """Upload one file and return its sanitized remote name.
 
     Returns _UPEX_CANCELED when the user stopped the upload, and None when the
-    upload failed.  The caller must not run the app after a cancel.
-    """
+    upload failed.  The caller must not run the app after a cancel.  With a
+    group, Ctrl+Z reaches this upload but Ctrl+B does not stop it."""
     name = os.path.basename(local_path)
     op = Op('upload', next_request_id(), label='upex upload {}'.format(name))
     op.transfer_serial = next(TRANSFER_SERIAL)
@@ -5956,11 +6316,15 @@ def _upex_upload_one(link, local_path):
     op.transfer_kind = 'file'
     op.transfer_status = 'scanning'
     link.add(op)
-    print("[+] Uploading {}...".format(name))
+    if group is not None:
+        group.register(op)
+    _upex_say("[+] Uploading {}{}...".format(name, context))
     threading.Thread(target=_upload_transfer,
                      args=(link, op, local_path, None),
                      name='upex-upload', daemon=True).start()
-    status = wait_foreground(op, cancelable=True, backgroundable=False)
+    status = _upex_wait(op, link, group)
+    if group is not None:
+        group.unregister(op)
     remote_name = op.transfer_name
     if op.succeeded:
         link.drop(op)
@@ -5973,117 +6337,438 @@ def _upex_upload_one(link, local_path):
     return remote_name or name
 
 
+UPEX_OS_GROUPS = {
+    # Rule 4 names three families.  Android/Termux is a Linux userland and
+    # iOS is Apple's mobile OS, so a --linux/--mac share is useful there too.
+    'windows': ('windows',),
+    'linux': ('linux', 'android'),
+    'mac': ('macos', 'ios'),
+}
+
+
 def _upex_usage():
-    print("[!] Usage: upex <app.py|app.c|app.cpp|app.cs|app.js|app.swift|")
-    print("               app.sh|app.bat|app.ps1|app.vbs|app.exe|app.elf|")
-    print("               app.macho|app>")
+    print("[!] Usage: upex <app.ext> [options]")
+    print("       upex <app.ext> -all")
+    print("       upex <app.ext> --windows -all   (or --windows-all)")
+    print("       upex <app.ext> --linux -all     (or --linux-all; Linux/Android)")
+    print("       upex <app.ext> --mac -all       (or --mac-all; macOS/iOS)")
+    print("       upex a.bat --windows-all & b.sh --linux-all & c.sh --mac-all")
+    print("    Options may come before or after the file; a gap in --windows-all")
+    print("    makes no difference.  -all tries every session: a type that does")
+    print("    not fit one OS fails only there, and the other sessions still run.")
     print("    Or:    upex auto.<py|cs|js|sh> <app.py|app.js|app.cs|app.ts|app.sh>")
     print("    Hidden: upex -h auto.<py|cs|js|sh> <app...>")
-    print("    Windows only: .bat, .ps1, .vbs and .exe apps.")
+    print("    Types:  py c cpp cs js ts swift sh bat ps1 vbs exe elf macho bin")
     print("    The optional auto.<type> launcher is read from the controller's")
     print("    auto/ folder (or the controller folder).")
 
 
-def _run_upex(link, line):
-    """Handle a controller-side upex command. Returns 'done' or 'dead'."""
-    parts = split_args(line)
-    args = parts[1:]
+def _upex_split_chain(line):
+    """Split 'upex a -all & b --linux -all' on unquoted ampersands."""
+    segments = []
+    current = []
+    quote = None
+    for ch in line:
+        if quote:
+            current.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in ('"', "'"):
+            quote = ch
+            current.append(ch)
+        elif ch == '&':
+            text = ''.join(current).strip()
+            if text:
+                segments.append(text)
+            current = []
+        else:
+            current.append(ch)
+    text = ''.join(current).strip()
+    if text:
+        segments.append(text)
+    return segments
+
+
+def _upex_parse_segment(segment):
+    """Parse one upex command. Returns a dict, or None for bad syntax."""
+    parts = split_args(segment)
+    if parts and parts[0].lower() == 'upex':
+        parts = parts[1:]
     hidden = False
-    if args and args[0] in ('-h', '--hidden'):
-        hidden = True
-        args = args[1:]
-    if not args or len(args) > 2:
-        _upex_usage()
-        return 'done'
-
+    all_sessions = False
+    filters = []
+    rest = []
+    for arg in parts:
+        low = arg.lower()
+        if low in ('-h', '--hidden'):
+            hidden = True
+        elif low in ('-all', '--all'):
+            all_sessions = True
+        elif low == '--windows':
+            filters.append('windows')
+        elif low == '--windows-all':
+            filters.append('windows')
+            all_sessions = True
+        elif low == '--linux':
+            filters.append('linux')
+        elif low == '--linux-all':
+            filters.append('linux')
+            all_sessions = True
+        elif low == '--mac':
+            filters.append('mac')
+        elif low == '--mac-all':
+            filters.append('mac')
+            all_sessions = True
+        else:
+            rest.append(arg)
+    if not rest or len(rest) > 2:
+        return None
     auto_arg = None
-    if len(args) == 1:
+    if len(rest) == 1:
         if hidden:
-            _upex_usage()
-            return 'done'
-        app_arg = args[0]
+            return None             # hidden mode needs an auto launcher
+        app_arg = rest[0]
     else:
-        auto_arg, app_arg = args
+        auto_arg, app_arg = rest
         if not os.path.basename(auto_arg).lower().startswith('auto.'):
-            _upex_usage()
-            return 'done'
+            return None
+    return {
+        'hidden': hidden,
+        'all': all_sessions or bool(filters),
+        'filters': filters,
+        'auto_arg': auto_arg,
+        'app_arg': app_arg,
+    }
 
-    app_path = os.path.expanduser(app_arg)
-    if not os.path.isabs(app_path):
-        app_path = os.path.join(os.getcwd(), app_path)
-    app_path = os.path.abspath(app_path)
-    if not os.path.isfile(app_path):
-        print("[!] Not a local file: {}".format(app_arg))
+
+def _session_targets(filters, all_sessions):
+    """(number, link) pairs a broadcast command applies to, in session order.
+
+    Shared by upex and upload: filters win over a plain active session, and a
+    filter implies every matching session (Rule 4's '--windows[-all]' form)."""
+    with SESSIONS_COND:
+        rows = [(number, SESSIONS[number]) for number in sorted(SESSIONS)
+                if not SESSIONS[number].dead]
+    if filters:
+        allowed = set()
+        for name in filters:
+            allowed.update(UPEX_OS_GROUPS.get(name, ()))
+        return [(number, target) for number, target in rows
+                if _upex_os_name(target) in allowed]
+    if all_sessions:
+        return rows
+    active = _active_link()
+    if active is None or active.dead or active.number is None:
+        return []
+    return [(active.number, active)]
+
+
+def _upex_targets(link, parsed):
+    """(number, link) pairs this command applies to, in session order."""
+    return _session_targets(parsed['filters'], parsed['all'])
+
+
+def _split_target_flags(tokens):
+    """Pull target flags out of an upload argument list.
+
+    Returns (filters, all_sessions, rest).  A gap makes no difference:
+    '--windows -all' and '--windows-all' both mean windows + every matching
+    session; a filter on its own also implies every matching session."""
+    filters = []
+    all_sessions = False
+    rest = []
+    for token in tokens:
+        low = token.lower()
+        if low in ('-all', '--all'):
+            all_sessions = True
+        elif low == '--windows':
+            filters.append('windows')
+        elif low == '--windows-all':
+            filters.append('windows')
+            all_sessions = True
+        elif low == '--linux':
+            filters.append('linux')
+        elif low == '--linux-all':
+            filters.append('linux')
+            all_sessions = True
+        elif low == '--mac':
+            filters.append('mac')
+        elif low == '--mac-all':
+            filters.append('mac')
+            all_sessions = True
+        else:
+            rest.append(token)
+    if filters:
+        all_sessions = True
+    return filters, all_sessions, rest
+
+
+def _upload_usage():
+    print("[!] Usage: upload <local_path> [<more> ...] [--as <name>] [&]")
+    print("       upload <local_path> -all")
+    print("       upload <local_path> --windows -all   (or --windows-all)")
+    print("       upload <local_path> --linux -all     (or --linux-all; Linux/Android)")
+    print("       upload <local_path> --mac -all       (or --mac-all; macOS/iOS)")
+    print("       upload a.zip -all & b.mp4 --linux-all   (chain with &)")
+    print("    Any file or folder of any size; folders are copied recursively.")
+    print("    -all uploads to every session; a filter uploads only to that OS.")
+    print("    A gap in --windows-all makes no difference; a filter implies -all.")
+
+
+def _upload_coalesce_paths(items):
+    """Join unquoted tokens that together name an existing path.
+
+    This keeps 'upload /path/with space/file' working while 'upload a b'
+    still means two paths.  Quoted paths already arrive as one token from
+    split_args()."""
+    if not items:
+        return []
+    if all(os.path.exists(os.path.expanduser(t)) for t in items):
+        return items
+    result = []
+    index = 0
+    while index < len(items):
+        found = None
+        for end in range(len(items), index, -1):
+            candidate = ' '.join(items[index:end])
+            if os.path.exists(os.path.expanduser(candidate)):
+                found = candidate
+                index = end
+                break
+        if found is None:
+            result.append(items[index])
+            index += 1
+        else:
+            result.append(found)
+    return result
+
+
+def _upload_expand_paths(tokens):
+    """Resolve upload path tokens: join path words, expand ~ and globs.
+
+    Returns (paths, missing).  A glob that matches nothing is reported and
+    skipped; everything else is passed through so a precise 'not found'
+    message can be given later.  Duplicates are dropped in first-seen order,
+    so 'upload a.txt a.txt' cannot start two transfers racing on one file."""
+    expanded = []
+    missing = []
+    seen = set()
+    for token in _upload_coalesce_paths(tokens):
+        token = os.path.expanduser(token)
+        if any(ch in token for ch in '*?['):
+            matches = sorted(glob.glob(token))
+            if not matches:
+                missing.append(token)
+                continue
+            for match in matches:
+                key = os.path.abspath(match)
+                if key not in seen:
+                    seen.add(key)
+                    expanded.append(match)
+            continue
+        key = os.path.abspath(token)
+        if key not in seen:
+            seen.add(key)
+            expanded.append(token)
+    return expanded, missing
+
+
+def _upload_parse_segment(segment):
+    """Parse one upload command. Returns a dict, or None for bad syntax."""
+    parts = split_args(segment)
+    if parts and parts[0].lower() in ('upload', 'uploaddir', 'upload-dir',
+                                      'uploadfolder', 'upload-folder'):
+        parts = parts[1:]
+    remote_name = None
+    if '--as' in parts:
+        index = parts.index('--as')
+        if index + 2 != len(parts):
+            return None
+        remote_name = parts[index + 1]
+        parts = parts[:index]
+    filters, all_sessions, rest = _split_target_flags(parts)
+    if not rest:
+        return None
+    return {
+        'filters': filters,
+        'all': all_sessions,
+        'paths': rest,
+        'remote_name': remote_name,
+    }
+
+
+def _upload_start(target, number, local_path, remote_name, total):
+    """Start one background upload of one path to one session."""
+    initial_name = remote_name or os.path.basename(
+        os.path.abspath(local_path).rstrip(os.sep)) or local_path
+    label = 'upload {}'.format(local_path)
+    if total > 1:
+        label = '{} (session {})'.format(label, number)
+    op = Op('upload', next_request_id(), label=label)
+    op.transfer_serial = next(TRANSFER_SERIAL)
+    op.transfer_name = initial_name
+    op.transfer_kind = ('folder' if os.path.isdir(local_path) else 'file')
+    op.transfer_status = 'scanning'
+    op.background = True
+    target.add(op)
+    prefix = '[session {}] '.format(number) if total > 1 else ''
+    print("[+] {}Preparing upload {}...".format(prefix, local_path))
+    threading.Thread(target=_upload_transfer,
+                     args=(target, op, local_path, remote_name),
+                     name='upload-transfer', daemon=True).start()
+    return op
+
+
+def _upload_run_one(link, segment):
+    """Handle one (possibly multi-session) upload command. Returns a status."""
+    parsed = _upload_parse_segment(segment)
+    if parsed is None:
+        _upload_usage()
         return 'done'
 
-    os_name = _upex_os_name(link)
-    app_type = _upex_detect_type(app_path, os_name)
-
-    auto_path = None
-    auto_type = None
-    if auto_arg:
-        auto_type = _upex_type_from_name(auto_arg)
-        if auto_type not in UPEX_AUTO_TYPES:
-            print("[!] Auto mode supports only auto.py, auto.cs, auto.js "
-                  "and auto.sh.")
-            return 'done'
-        auto_path = _upex_auto_path(auto_arg)
-        if auto_path is None:
-            print("[i] {} was not found in the controller's auto/ folder; "
-                  "falling back to normal upex.".format(auto_arg))
-            auto_arg = None
-            auto_type = None
-            if hidden:
-                print("[i] Hidden mode needs an auto launcher; running the "
-                      "app normally.")
-                hidden = False
-
-    error = _upex_validate(app_type, os_name, auto_mode=auto_path is not None)
-    if error:
-        print("[!] {}".format(error))
+    expanded, missing = _upload_expand_paths(parsed['paths'])
+    if missing:
+        print("[!] Not found: {}".format(', '.join(missing)))
+    if not expanded:
         return 'done'
-
-    if auto_path is not None:
-        if os.path.basename(app_path) == os.path.basename(auto_path):
-            print("[!] The app and auto launcher cannot have the same name.")
+    if parsed['remote_name'] is not None and len(expanded) != 1:
+        print("[!] --as can only be used with one file or folder.")
+        return 'done'
+    for local_path in expanded:
+        if not os.path.exists(local_path):
+            print("[!] Could not read local path: {} (no such file or folder)"
+                  .format(local_path))
             return 'done'
 
-    app_remote = _upex_upload_one(link, app_path)
-    if app_remote is _UPEX_CANCELED:
-        print("[+] upex canceled.")
+    targets = _session_targets(parsed['filters'], parsed['all'])
+    if not targets:
+        if parsed['filters']:
+            print("[!] No {} session is connected. Type 'session' to list "
+                  "them.".format('/'.join(parsed['filters'])))
+        else:
+            print("[!] No session is connected.")
         return 'done'
-    if app_remote is None:
+
+    started = 0
+    reached = []
+    for number, target in targets:
+        if target.dead:
+            continue
+        for local_path in expanded:
+            _upload_start(target, number, local_path, parsed['remote_name'],
+                          len(targets))
+            started += 1
+        reached.append(number)
+    if started:
+        _live_start()
+        if len(reached) > 1:
+            print("[+] {} upload(s) started to session(s) {}; the prompt is "
+                  "free. Use 'cancel' to list or stop them.".format(
+                      started, ', '.join(str(n) for n in reached)))
+        else:
+            print("[+] {} upload(s) started; the prompt is free. "
+                  "Use 'cancel' to list or stop them.".format(started))
+    return 'done'
+
+
+def _run_upload(link, line):
+    """Handle one or more '&'-chained upload commands. Returns 'done'/'dead'."""
+    segments = _upex_split_chain(line)
+    if not segments:
+        _upload_usage()
+        return 'done'
+    for segment in segments:
         if link.dead:
             return 'dead'
-        print("[!] Upload failed; nothing was executed.")
-        return 'done'
+        if _upload_run_one(link, segment) == 'dead':
+            return 'dead'
+    return 'done'
+
+
+def _upex_universal_error(app_type, auto_mode):
+    """Checks that do not depend on the target OS (for '-all')."""
+    if auto_mode:
+        if app_type not in UPEX_AUTO_APP_TYPES:
+            return ('auto mode accepts app.py, app.js, app.cs, app.ts or '
+                    'app.sh')
+        return None
+    if app_type == 'ts':
+        return ('TypeScript needs an auto launcher; use '
+                '"upex auto.py app.ts", auto.cs, auto.js or auto.sh')
+    if app_type not in UPEX_APP_TYPES:
+        return 'unsupported app type'
+    return None
+
+
+def _upex_precheck(parsed, app_type, active_link, auto_mode=False):
+    """Validate before uploading; OS compatibility is per target for -all."""
+    if parsed['filters']:
+        if len(parsed['filters']) == 1:
+            representative = {'windows': 'windows', 'linux': 'linux',
+                              'mac': 'macos'}[parsed['filters'][0]]
+            return _upex_validate(app_type, representative,
+                                  auto_mode=auto_mode)
+        return _upex_universal_error(app_type, auto_mode=auto_mode)
+    if parsed['all']:
+        return _upex_universal_error(app_type, auto_mode=auto_mode)
+    return _upex_validate(app_type, _upex_os_name(active_link),
+                          auto_mode=auto_mode)
+
+
+def _upex_run_target(link, number, parsed, app_path, app_type,
+                     auto_path, auto_type, auto_arg, total, group=None):
+    """Upload and run one app on one session. Returns a short status.
+
+    With a group this runs in that group's worker thread: the upload must
+    finish before the app starts, while Ctrl+B keeps the app itself running in
+    the background."""
+    context = ' to session {}'.format(number) if total > 1 else ''
+    app_remote = _upex_upload_one(link, app_path, context, group)
+    if app_remote is _UPEX_CANCELED:
+        _upex_say("[+] upex canceled{}.".format(
+            ' for session {}'.format(number) if total > 1 else ''))
+        return 'canceled'
+    if app_remote is None:
+        if link.dead:
+            return 'disconnected'
+        _upex_say("[!] {}upload failed; nothing was executed.".format(
+            'Session {}: '.format(number) if total > 1 else ''))
+        return 'failed'
 
     auto_remote = None
+    hidden_here = parsed['hidden']
     if auto_path is not None:
-        auto_remote = _upex_upload_one(link, auto_path)
+        auto_remote = _upex_upload_one(link, auto_path, context, group)
         if auto_remote is _UPEX_CANCELED:
-            print("[+] upex canceled; the app was not run.")
-            return 'done'
+            _upex_say("[+] upex canceled; the app was not run.")
+            return 'canceled'
         if auto_remote is None:
             if link.dead:
-                return 'dead'
-            print("[!] Could not upload {}; running the app normally."
-                  .format(auto_arg))
+                return 'disconnected'
+            _upex_say("[!] {}could not upload {}; running the app normally."
+                      .format('Session {}: '.format(number) if total > 1 else '',
+                              auto_arg))
             auto_remote = None
             auto_type = None
-            hidden = False
-            error = _upex_validate(app_type, os_name, auto_mode=False)
+            hidden_here = False
+            if parsed['all'] and not parsed['filters']:
+                error = _upex_universal_error(app_type, auto_mode=False)
+            else:
+                error = _upex_validate(app_type, _upex_os_name(link),
+                                       auto_mode=False)
             if error:
-                print("[!] {}".format(error))
-                return 'done'
+                _upex_say("[!] {}".format(error))
+                return 'failed'
         elif app_remote == auto_remote:
-            print("[!] The uploaded app and auto launcher collided; refusing "
-                  "to execute.")
-            return 'done'
+            _upex_say("[!] The uploaded app and auto launcher collided; "
+                      "refusing to execute.")
+            return 'failed'
 
     label = 'upex {}'.format(app_remote)
     if auto_remote:
         label = 'upex {} {}'.format(auto_remote, app_remote)
+    if total > 1:
+        label = '{} (session {})'.format(label, number)
     op = Op('upex', next_request_id(), label=label)
     request = {
         'type': 'upex',
@@ -6091,17 +6776,204 @@ def _run_upex(link, line):
         'app_type': app_type,
         'auto': auto_remote,
         'auto_type': auto_type,
-        'hidden': bool(hidden and auto_remote),
+        'hidden': bool(hidden_here and auto_remote),
     }
+    prefix = '[session {}] '.format(number) if total > 1 else ''
     if auto_remote:
-        print("[+] Running {} {}{} on the client...".format(
-            auto_remote, app_remote, ' (hidden)' if hidden else ''))
+        _upex_say("[+] {}Running {} {}{}...".format(
+            prefix, auto_remote, app_remote,
+            ' (hidden)' if hidden_here else ''))
     else:
-        print("[+] Running {} on the client...".format(app_remote))
-    status = ask(link, op, request)
+        _upex_say("[+] {}Running {}...".format(prefix, app_remote))
+    if group is not None:
+        # Set the link first so a Ctrl+Z that races the send can reach the op.
+        op.link = link
+        group.register(op)
+    # Ctrl+C leaves the controller and keeps the app alive; Ctrl+Z cancels it.
+    status = ask(link, op, request, ctrl_c_leaves=True)
+    if group is not None:
+        group.unregister(op)
     if status == 'dead':
+        return 'disconnected'
+    if op.canceled:
+        return 'canceled'
+    if status == 'background':
+        return 'background'
+    return 'done' if op.succeeded else 'failed'
+
+
+def _upex_prepare(link, segment):
+    """Validate one upex segment and choose its target sessions.
+
+    Prints any usage/validation message and returns None when the segment
+    cannot run; otherwise a plan dict is returned.  Preparation is separate
+    from running so a '&' chain can start every segment together."""
+    parsed = _upex_parse_segment(segment)
+    if parsed is None:
+        _upex_usage()
+        return None
+
+    app_arg = parsed['app_arg']
+    app_path = os.path.expanduser(app_arg)
+    if not os.path.isabs(app_path):
+        app_path = os.path.join(os.getcwd(), app_path)
+    app_path = os.path.abspath(app_path)
+    if not os.path.isfile(app_path):
+        print("[!] Not a local file: {}".format(app_arg))
+        return None
+
+    app_type = _upex_detect_type(app_path)
+
+    auto_arg = parsed['auto_arg']
+    auto_path = None
+    auto_type = None
+    if auto_arg:
+        auto_type = _upex_type_from_name(auto_arg)
+        if auto_type not in UPEX_AUTO_TYPES:
+            print("[!] Auto mode supports only auto.py, auto.cs, auto.js "
+                  "and auto.sh.")
+            return None
+        auto_path = _upex_auto_path(auto_arg)
+        if auto_path is None:
+            print("[i] {} was not found in the controller's auto/ folder; "
+                  "falling back to normal upex.".format(auto_arg))
+            auto_arg = None
+            auto_type = None
+            if parsed['hidden']:
+                print("[i] Hidden mode needs an auto launcher; running the "
+                      "app normally.")
+                parsed['hidden'] = False
+
+    error = _upex_precheck(parsed, app_type, link,
+                           auto_mode=auto_path is not None)
+    if error:
+        print("[!] {}".format(error))
+        return None
+
+    if auto_path is not None:
+        if os.path.basename(app_path) == os.path.basename(auto_path):
+            print("[!] The app and auto launcher cannot have the same name.")
+            return None
+
+    targets = _upex_targets(link, parsed)
+    if not targets:
+        if parsed['filters']:
+            print("[!] No {} session is connected. Type 'session' to list "
+                  "them.".format('/'.join(parsed['filters'])))
+        else:
+            print("[!] No session is connected.")
+        return None
+
+    return {'parsed': parsed, 'app_path': app_path, 'app_type': app_type,
+            'auto_arg': auto_arg, 'auto_path': auto_path,
+            'auto_type': auto_type, 'targets': targets}
+
+
+def _upex_execute(link, plans):
+    """Run one or more prepared segments; every target starts at the same time.
+
+    All sessions of all segments upload together and each app starts as soon
+    as its own upload lands, independently of the others; a failure on one
+    session never delays or aborts another.  Returns 'done'/'canceled'/'dead'.
+    """
+    if not plans:
+        return 'done'
+
+    jobs = [(number, target, plan)
+            for plan in plans for number, target in plan['targets']]
+
+    # One session in one segment keeps the simple foreground behaviour (the
+    # app itself is still backgroundable with Ctrl+B through ask()).
+    if len(plans) == 1 and len(jobs) == 1:
+        number, target, plan = jobs[0]
+        if target.dead:
+            return 'done'
+        status = _upex_run_target(
+            target, number, plan['parsed'], plan['app_path'],
+            plan['app_type'], plan['auto_path'], plan['auto_type'],
+            plan['auto_arg'], 1, None)
+        if status == 'canceled':
+            return 'canceled'
+        if status == 'disconnected' and target is link:
+            return 'dead'
+        return 'done'
+
+    groups = []
+    for plan in plans:
+        group = _UpexGroup(link, plan['targets'],
+                           announce=len(plan['targets']) > 1)
+        groups.append(group)
+    if len(groups) == 1:
+        waiter = groups[0]
+    else:
+        waiter = _UpexChain(link)
+        for group in groups:
+            waiter.add(group)
+        waiter.start()
+
+    for group, plan in zip(groups, plans):
+        for number, target in plan['targets']:
+            if target.dead:
+                # No worker for a dead session; count it so the group ends.
+                group.finish(number, 'disconnected')
+                continue
+            threading.Thread(
+                target=_upex_target_worker,
+                args=(group, target, number, plan['parsed'], plan['app_path'],
+                      plan['app_type'], plan['auto_path'], plan['auto_type'],
+                      plan['auto_arg']),
+                name='upex-target', daemon=True).start()
+
+    wait_foreground(waiter, cancelable=True, backgroundable=True,
+                    ctrl_c_leaves=True)
+    if getattr(waiter, 'canceled', False):
+        return 'canceled'
+    if link.dead:
         return 'dead'
     return 'done'
+
+
+def _upex_target_worker(group, link, number, parsed, app_path, app_type,
+                        auto_path, auto_type, auto_arg):
+    """Upload and run one session's app inside a parallel upex group."""
+    status = 'failed'
+    try:
+        status = _upex_run_target(
+            link, number, parsed, app_path, app_type, auto_path, auto_type,
+            auto_arg, group.total, group)
+    except Exception as e:
+        _upex_say("[!] Session {}: upex error: {}".format(number, e))
+        status = 'failed'
+    finally:
+        group.finish(number, status)
+
+
+def _upex_run_one(link, segment):
+    """Run one (possibly multi-session) upex command."""
+    plan = _upex_prepare(link, segment)
+    if plan is None:
+        return 'done'
+    return _upex_execute(link, [plan])
+
+
+def _run_upex(link, line):
+    """Handle one or more '&'-chained upex commands. Returns 'done'/'dead'.
+
+    Every segment is prepared first, then all of their sessions run at the
+    same moment (Rule 4 parts 1-3 in parallel).  Ctrl+B backgrounds the whole
+    chain; Ctrl+Z cancels it."""
+    segments = _upex_split_chain(line)
+    if not segments:
+        _upex_usage()
+        return 'done'
+    plans = []
+    for segment in segments:
+        if link.dead:
+            return 'dead'
+        plan = _upex_prepare(link, segment)
+        if plan is not None:
+            plans.append(plan)
+    return _upex_execute(link, plans)
 
 
 OPTION_ROWS = [
@@ -6113,7 +6985,12 @@ OPTION_ROWS = [
     ('download <client_path> [save_as]', 'Copy a file from the client to this machine.'),
     ('download --multi <path> <path>...', 'Download several files/folders at once.'),
     ('upload <local_path> [<path>...]', 'Upload one or many files/folders (globs work).'),
+    ('upload <path> -all', 'Upload to every session; a filter targets one OS (like upex).'),
+    ('upload <path> --windows-all', 'Only Windows. --linux-all = Linux/Android; --mac-all = macOS/iOS.'),
     ('upex <app.ext>', 'Upload and run an app (py/c/c++/cs/js/swift/sh/bat/ps1/vbs/exe/elf/macho).'),
+    ('upex <app.ext> -all', 'Upload and run on every session; a type mismatch fails only on that session.'),
+    ('upex <app.ext> --windows-all', 'Only Windows sessions. --linux-all = Linux/Android; --mac-all = macOS/iOS.'),
+    ('upex a.ext --windows -all & b.ext --linux -all', 'Chain upex commands with & (gap or no gap is the same).'),
     ('upex auto.<type> <app>', 'Upload auto.py/cs/js/sh and the app, then run the auto launcher.'),
     ('upex -h auto.<type> <app>', 'Same as above in hidden mode (auto launchers only).'),
     ('cancel [<N> ... | all]', 'List live transfers; stop selected ones after one y/N.'),
@@ -6129,7 +7006,8 @@ OPTION_ROWS = [
                     'reconnect when it is back.'),
     ('exit session <N>', 'Stop client N for good - it exits and will NOT reconnect.'),
     ('exit session all', 'Stop every client for good; this controller keeps running.'),
-    ('Ctrl+B', 'Move a running command / screenshot / share to the background.'),
+    ('Ctrl+B', 'Background a running command / upex / screenshot / share '
+               'and keep sending more.'),
     ('Ctrl+Z', 'Stop the running command / screenshot / share; prompt comes back.'),
     ('Ctrl+C', 'Leave the controller (clients keep running, same as exit).'),
     ('show options', 'This cheat sheet of every feature and its syntax.'),
@@ -6204,7 +7082,13 @@ def _print_help():
     print("[+]                   screenshot [save_as]           (one picture from the client)")
     print("[+]                   persist | unpersist           (client auto-starts after reboot/logon)")
     print("[+]                   download <client_path> [save_as]  |  upload <path> [<path>...]")
+    print("[+]                   upload <path> -all                (every session)")
+    print("[+]                   upload <path> --windows-all       (or --linux-all / --mac-all)")
+    print("[+]                   upload a.zip -all & b.mp4 --linux-all   (chain)")
     print("[+]                   upex <app.ext>                    (upload + execute)")
+    print("[+]                   upex <app.ext> -all               (every session)")
+    print("[+]                   upex <app.ext> --windows-all       (or --linux-all / --mac-all)")
+    print("[+]                   upex a.ext --windows -all & b.ext --linux -all   (chain)")
     print("[+]                   upex auto.<type> <app>             (auto launcher + app)")
     print("[+]                   upex -h auto.<type> <app>          (hidden auto mode)")
     print("[+]                   download --multi <path> <path>...   (many at once)")
@@ -6216,8 +7100,9 @@ def _print_help():
     print("[+]                   jobs | stop [all | <number>]   (operations in the background)")
     print("[+]                   exit session <number> | all    (stop that client - it will not reconnect)")
     print("[+]                   exit | quit                      (leave this controller; clients keep reconnecting)")
-    print("[+] Ctrl+B moves a running command / screen share / screenshot to the background.")
-    print("[+] Ctrl+Z stops a running command/share; use 'cancel' for transfers.")
+    print("[+] Ctrl+B backgrounds a running command / upex / share; you can keep")
+    print("[+]        starting more (each runs on the client at the same time).")
+    print("[+] Ctrl+Z stops a running command/share/upex; use 'cancel' for transfers.")
     print("[+] Ctrl+C also leaves this controller; clients keep reconnecting.")
     print("[+] Clients keep retrying every second until stopped with 'exit session ...'.")
     print("[+] iPhone/iPad: start with  --viewer-lan  and open the LAN URL in Safari.")
@@ -6256,6 +7141,25 @@ def serve(link):
         if outcome == 'rescan':
             return False
 
+
+def _successor_link(link):
+    """The live link that transparently replaced `link` after a reconnect.
+
+    Only an instance-id resume counts: without one we cannot prove the new
+    link belongs to the same machine, and a command typed for the old session
+    must never run somewhere else.
+    """
+    if link.number is None or not link.instance:
+        return None
+    with SESSIONS_COND:
+        candidate = SESSIONS.get(link.number)
+    if candidate is None or candidate is link or candidate.dead:
+        return None
+    if candidate.instance != link.instance:
+        return None
+    return candidate
+
+
 def _serve_one_command(link, line):
     """Run one submitted command line against `link`.
 
@@ -6268,15 +7172,23 @@ def _serve_one_command(link, line):
     """
     # The session may have ended (or another one may have become active)
     # while the prompt was waiting for Enter. Never send that command to
-    # a different machine by accident.
+    # a different machine by accident.  A transparent reconnect of the same
+    # instance is the one safe exception: the machine is unchanged, so the
+    # command typed during the drop runs on the resumed link.
     if link.dead or _active_link() is not link:
-        if _active_link() is None:
+        successor = _successor_link(link)
+        if successor is not None and _active_link() is successor:
+            print("[i] Session {} reconnected while you were typing; running "
+                  "that command on the resumed link.".format(link.number))
+            link = successor
+        elif _active_link() is None:
             print("[!] The active session disconnected while you were typing - "
                   "that command was not run. Waiting for a client...")
+            return 'rescan'
         else:
             print("[!] The active session changed while you were typing - that "
                   "command was not run. Please type it again.")
-        return 'rescan'
+            return 'rescan'
     if _handle_local_command(line):
         return 'keep'              # options/help are answered here, never sent
 
@@ -6448,109 +7360,8 @@ def _serve_one_command(link, line):
                         'uploadfolder ', 'upload-folder ')):
         line = 'upload ' + line.split(None, 1)[1]
     if line == 'upload' or line.startswith('upload '):
-        background = False
-        stripped = line.rstrip()
-        if stripped.endswith('&'):
-            background = True
-            line = stripped[:-1].rstrip()
-        parts = split_args(line)
-        if len(parts) < 2:
-            print("[!] Usage: upload <local_path> [<more> ...] [--as <name>] [&]")
-            print("    Files and whole folders are detected automatically;")
-            print("    every file and folder uses the unlimited streamed protocol.")
-            return 'keep'
-        remote_name = None
-        if '--as' in parts:
-            index = parts.index('--as')
-            if index + 2 != len(parts):
-                print("[!] Usage: upload <local_path> --as <remote_name>")
-                return 'keep'
-            remote_name = parts[index + 1]
-            parts = parts[:index]
-        if len(parts) < 2:
-            print("[!] Usage: upload <local_path> [--as <remote_name>]")
-            return 'keep'
-        tokens = parts[1:]
-
-        def _coalesce_paths(items):
-            """Join unquoted tokens that together name an existing path.
-
-            This keeps 'upload /path/with space/file' working while
-            'upload a b' still means two paths.  Quoted paths already
-            arrive as one token from split_args().
-            """
-            if not items:
-                return []
-            if all(os.path.exists(os.path.expanduser(t)) for t in items):
-                return items
-            result = []
-            index = 0
-            while index < len(items):
-                found = None
-                for end in range(len(items), index, -1):
-                    candidate = ' '.join(items[index:end])
-                    if os.path.exists(os.path.expanduser(candidate)):
-                        found = candidate
-                        index = end
-                        break
-                if found is None:
-                    result.append(items[index])
-                    index += 1
-                else:
-                    result.append(found)
-            return result
-
-        tokens = _coalesce_paths(tokens)
-        expanded = []
-        missing = []
-        for token in tokens:
-            token = os.path.expanduser(token)
-            if any(ch in token for ch in '*?['):
-                matches = sorted(glob.glob(token))
-                if matches:
-                    expanded.extend(matches)
-                else:
-                    missing.append(token)
-                return 'keep'
-            expanded.append(token)
-        if missing:
-            print("[!] Not found: {}".format(', '.join(missing)))
-        if not expanded:
-            return 'keep'
-        if remote_name is not None and len(expanded) != 1:
-            print("[!] --as can only be used with one file or folder.")
-            return 'keep'
-        # Start each scan in its own worker as well.  The prompt returns
-        # before a giant folder has even been walked, and 'cancel' can
-        # stop the scan or the transfer.  The live dashboard shows the
-        # row as 'scanning' until the totals are known.
-        started = []
-        for local_path in expanded:
-            if not os.path.exists(local_path):
-                print("[!] Could not read local path: {} (no such file or folder)"
-                      .format(local_path))
-                return 'keep'
-            initial_name = remote_name or os.path.basename(
-                os.path.abspath(local_path).rstrip(os.sep)) or local_path
-            op = Op('upload', next_request_id(),
-                    label='upload {}'.format(local_path))
-            op.transfer_serial = next(TRANSFER_SERIAL)
-            op.transfer_name = initial_name
-            op.transfer_kind = ('folder' if os.path.isdir(local_path)
-                                else 'file')
-            op.transfer_status = 'scanning'
-            op.background = True
-            link.add(op)
-            print("[+] Preparing upload {}...".format(local_path))
-            threading.Thread(target=_upload_transfer,
-                             args=(link, op, local_path, remote_name),
-                             name='upload-transfer', daemon=True).start()
-            started.append(op)
-        if started:
-            _live_start()
-            print("[+] {} upload(s) started; the prompt is free. "
-                  "Use 'cancel' to list or stop them.".format(
-                      len(started)))
+        if _run_upload(link, line) == 'dead':
+            return 'rescan'
         return 'keep'
     if line == 'screenshot' or line.startswith('screenshot '):
         parts = split_args(line)
@@ -6708,14 +7519,15 @@ def _finish_client_link(client_socket, addr, env, transport_label,
                         new_protocol, features=None):
     """Create/register one control link after its hello has been read."""
     link = ClientLink(client_socket, addr)
-    link.number = _next_session_number()
     link.env = env
+    link.instance = (features or {}).get('instance') or ''
     link.on_dead = _link_died
-    # Optional per-frame acknowledgements let a new client avoid filling a
-    # slow tunnel's buffers with stale screen frames.  Half-duplex and poll
-    # transports have no independent downlink during a stream, so they keep
-    # the older send-only behavior.  Old clients never advertise this.
-    link.frame_ack = bool((features or {}).get('frame_ack')) and            transport_label not in ('HTTP-half', 'HTTP-poll')
+    # Per-frame acknowledgements let a client avoid filling a slow tunnel's
+    # buffers with stale screen frames.  Every transport has a reverse path
+    # (WebSocket/TCP directly, HTTP-stream/half over /down, poll over the next
+    # down request), so acks are enabled everywhere.  Old clients never
+    # advertise the capability and keep the old send-only behavior.
+    link.frame_ack = bool((features or {}).get('frame_ack'))
     if new_protocol:
         # This acknowledgement is the final end-to-end proof: it only reaches
         # the client after its hello arrived here.  A proxy that buffers
@@ -6739,6 +7551,9 @@ def _finish_client_link(client_socket, addr, env, transport_label,
     if link.dead:
         link.close()
         return link
+    if link.resumed:
+        _async_print("[i] Client reconnected - session {} resumed{}.".format(
+            link.number, " and is active" if became_active else ""))
     if became_active:
         return link                # the prompt shows the help right away
     current = _active_link()
